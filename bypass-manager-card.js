@@ -1,5 +1,5 @@
 /**
- * Bypass & Timer Manager Card
+ * Bypass Manager Card
  *
  * Two discovery modes (discovery_mode):
  *   "prefix" (default) — finds all input_boolean.<prefix>* and timer.<prefix>* entities.
@@ -16,7 +16,7 @@
  *   paused  → shows remaining time, Start (resume) / Cancel / Finish + +/- buttons
  */
 
-const VERSION = "2026.05.23.30";
+const VERSION = "2026.05.23.31";
 
 const GROUP_ORDER = ["Motion", "Door", "Window", "Light", "Other"];
 // INCREMENT_STEP is now read from config (increment_step + increment_unit).
@@ -517,13 +517,13 @@ class BypassManagerCard extends HTMLElement {
     const hasBool           = !!row.bool;
     const hasTimer          = !!row.timer;
     const sl                = this._showBtnLabels;
-    const hideBadge         = this._config?.hide_timer_badge === true;
+    const showBadge         = this._config?.show_timer_badge === true;
     const showToggle        = this._showToggle;
     const showTimerInput    = this._showTimerInput;
     const showTimerControls = this._showTimerControls;
     const showEntityNames   = this._showEntityNames;
 
-    const timerOnlyHtml = hideBadge ? "" : `<span class="solo-timer-badge">timer only</span>`;
+    const timerOnlyHtml = showBadge ? `<span class="solo-timer-badge">timer only</span>` : "";
 
     // Determine which column is rightmost (carries the 16px right padding)
     const lastCol =
@@ -570,7 +570,7 @@ class BypassManagerCard extends HTMLElement {
 
   _render() {
     const cfg             = this._config ?? {};
-    const title           = cfg.title           ?? "Bypass Manager";
+    const title           = cfg.title           ?? "BYPASS & TIMER MANAGER";
     const activeColor     = cfg.active_color    ?? "var(--primary-color)";
     const fontTitle       = cfg.font_size_title ? `${cfg.font_size_title}px` : "13px";
     const fontName        = cfg.font_size_name  ? `${cfg.font_size_name}px` : "14px";
@@ -619,7 +619,7 @@ class BypassManagerCard extends HTMLElement {
 <style>
   :host { display: block; font-family: var(--primary-font-family, sans-serif); }
   .card { background: var(--card-background-color); border-radius: var(--ha-card-border-radius, 12px); padding: 12px 0 8px; }
-  .card-title { font-size: ${fontTitle}; font-weight: 600; letter-spacing: .05em; text-transform: uppercase; color: ${colorCardTitle}; padding: 0 16px 4px; }
+  .card-title { font-size: ${fontTitle}; font-weight: 600; letter-spacing: .05em; color: ${colorCardTitle}; padding: 0 16px 4px; }
   .card-secondary { font-size: ${secInfoSize}; font-weight: 500; letter-spacing: 0; text-transform: none; color: ${secInfoColor}; padding: 0 16px 8px; display: ${secInfoText ? "block" : "none"}; }
   .section-label { font-size: ${fontGroup}; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; color: ${colorGroupLabel}; opacity: .7; padding: 10px 16px 4px; }
 
@@ -742,7 +742,7 @@ class BypassManagerCard extends HTMLElement {
   }
 
   static getConfigElement() { return document.createElement("bypass-manager-card-editor"); }
-  static getStubConfig()    { return { title: "Bypass Manager", show_button_labels: false, type_filters: ["Motion","Door","Window","Light","Other"] }; }
+  static getStubConfig()    { return { title: "BYPASS & TIMER MANAGER", type_filters: ["Motion","Door","Window","Light","Other"] }; }
 }
 
 customElements.define("bypass-manager-card", BypassManagerCard);
@@ -775,7 +775,7 @@ class BypassManagerCardEditor extends HTMLElement {
   _set(key, value) {
     const next = { ...this._config, [key]: value };
     // Remove keys that match defaults to keep YAML tidy
-    if (key === "title"              && value === "Bypass Manager")                   delete next.title;
+    if (key === "title"              && value === "BYPASS & TIMER MANAGER")           delete next.title;
     if (key === "entity_prefix"      && (!value || value === "bypass_"))              delete next.entity_prefix;
     if (key === "discovery_mode"     && value === "prefix")                           delete next.discovery_mode;
     if (key === "discovery_label"    && (!value || value === "bypass"))               delete next.discovery_label;
@@ -794,7 +794,7 @@ class BypassManagerCardEditor extends HTMLElement {
     if (key === "font_size_name"     && (!value || value === 14))                     delete next.font_size_name;
     if (key === "font_size_group"    && (!value || value === 11))                     delete next.font_size_group;
     if (key === "font_size_timer"    && (!value || value === 13))                     delete next.font_size_timer;
-    if (key === "hide_timer_badge"   && value === false)                              delete next.hide_timer_badge;
+    if (key === "show_timer_badge"   && value === false)                              delete next.show_timer_badge;
     if (key === "show_toggle"          && value === true)  delete next.show_toggle;
     if (key === "show_timer_controls"  && value === true)  delete next.show_timer_controls;
     if (key === "show_entity_names"    && value === true)  delete next.show_entity_names;
@@ -813,12 +813,12 @@ class BypassManagerCardEditor extends HTMLElement {
 
   _render() {
     const cfg             = this._config;
-    const title           = cfg.title              ?? "Bypass Manager";
+    const title           = cfg.title              ?? "BYPASS & TIMER MANAGER";
     const entityPrefix    = cfg.entity_prefix      ?? "bypass_";
     const discoveryMode   = cfg.discovery_mode     ?? "prefix";
     const discoveryLabel  = cfg.discovery_label    ?? "bypass";
     const showBtnLabels   = cfg.show_button_labels === true;
-    const hideBadge       = cfg.hide_timer_badge   === true;
+    const showBadge       = cfg.show_timer_badge   === true;
     const activeColor     = cfg.active_color       ?? "";
     const colorCardTitle  = cfg.color_card_title   ?? "";
     const colorGroupLabel = cfg.color_group_label  ?? "";
@@ -1083,11 +1083,37 @@ class BypassManagerCardEditor extends HTMLElement {
     <ha-switch id="show_button_labels" ${showBtnLabels ? "checked" : ""}></ha-switch>
   </div>
 
+  <!-- Last changed row — toggle + font size + color -->
   <div class="field-row">
-    <label class="field-label" for="hide_timer_badge">Hide "timer only" badge
-      <span class="field-hint">Suppress the italic label on timer-only rows.</span>
+    <label class="field-label" for="show_last_changed">Show last changed row
+      <span class="field-hint">Display a second line under each entity row showing when the switch and timer last changed.</span>
     </label>
-    <ha-switch id="hide_timer_badge" ${hideBadge ? "checked" : ""}></ha-switch>
+    <ha-switch id="show_last_changed" ${showLastChanged ? "checked" : ""}></ha-switch>
+  </div>
+  <div class="sub-fields" id="last_changed_sub" style="${showLastChanged ? "" : "display:none"}">
+    <div class="field-row font-row">
+      <label class="field-label" for="font_size_last_changed">Font size
+        <span class="field-hint">Default: 11</span>
+      </label>
+      <input id="font_size_last_changed" class="num-input" type="number" min="8" max="24" step="1" value="${fontLastChanged}">
+    </div>
+    <div class="field-row col">
+      <label class="field-label">Color
+        <span class="field-hint">Leave blank to use the theme secondary text color.</span>
+      </label>
+      <div class="color-row">
+        <div class="color-swatch"><input type="color" id="color_last_changed_picker" value="${colorLastChanged.startsWith("#") ? colorLastChanged : "#9e9e9e"}"></div>
+        <input id="color_last_changed" class="text-input color-text" type="text" placeholder="var(--secondary-text-color) or #hex" value="${colorLastChanged.replace(/"/g, "&quot;")}">
+        <button class="color-clear" id="color_last_changed_clear">Reset</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="field-row">
+    <label class="field-label" for="show_timer_badge">Show "timer only" badge
+      <span class="field-hint">Show an italic "timer only" label on rows that have a timer but no bypass switch.</span>
+    </label>
+    <ha-switch id="show_timer_badge" ${showBadge ? "checked" : ""}></ha-switch>
   </div>
 
   <!-- Card title — text + font size + color -->
@@ -1095,7 +1121,7 @@ class BypassManagerCardEditor extends HTMLElement {
     <label class="field-label">Card title
       <span class="field-hint">Shown at the top of the card.</span>
     </label>
-    <input id="title" class="text-input" type="text" placeholder="Bypass Manager"
+    <input id="title" class="text-input" type="text" placeholder="BYPASS &amp; TIMER MANAGER"
            value="${title.replace(/"/g, "&quot;")}">
     <div class="sub-fields">
       <div class="field-row font-row">
@@ -1260,37 +1286,11 @@ class BypassManagerCardEditor extends HTMLElement {
     </div>
   </div>
 
-  <!-- Last changed row — toggle + font size + color -->
-  <div class="field-row">
-    <label class="field-label" for="show_last_changed">Show last changed row
-      <span class="field-hint">Display a second line under each entity row showing when the switch and timer last changed.</span>
-    </label>
-    <ha-switch id="show_last_changed" ${showLastChanged ? "checked" : ""}></ha-switch>
-  </div>
-  <div class="sub-fields" id="last_changed_sub" style="${showLastChanged ? "" : "display:none"}">
-    <div class="field-row font-row">
-      <label class="field-label" for="font_size_last_changed">Font size
-        <span class="field-hint">Default: 11</span>
-      </label>
-      <input id="font_size_last_changed" class="num-input" type="number" min="8" max="24" step="1" value="${fontLastChanged}">
-    </div>
-    <div class="field-row col">
-      <label class="field-label">Color
-        <span class="field-hint">Leave blank to use the theme secondary text color.</span>
-      </label>
-      <div class="color-row">
-        <div class="color-swatch"><input type="color" id="color_last_changed_picker" value="${colorLastChanged.startsWith("#") ? colorLastChanged : "#9e9e9e"}"></div>
-        <input id="color_last_changed" class="text-input color-text" type="text" placeholder="var(--secondary-text-color) or #hex" value="${colorLastChanged.replace(/"/g, "&quot;")}">
-        <button class="color-clear" id="color_last_changed_clear">Reset</button>
-      </div>
-    </div>
-  </div>
-
 </div>`;
 
     // ── Title ──
     const titleEl = this.shadowRoot.getElementById("title");
-    titleEl.addEventListener("change", () => this._set("title", titleEl.value || "Bypass Manager"));
+    titleEl.addEventListener("change", () => this._set("title", titleEl.value || "BYPASS & TIMER MANAGER"));
 
     // ── Discovery mode (segmented button group) ──
     const modeGroup = this.shadowRoot.getElementById("discovery_mode_group");
@@ -1321,9 +1321,9 @@ class BypassManagerCardEditor extends HTMLElement {
     const lblEl = this.shadowRoot.getElementById("show_button_labels");
     lblEl.addEventListener("change", () => this._set("show_button_labels", lblEl.checked));
 
-    // ── Hide timer badge ──
-    const badgeEl = this.shadowRoot.getElementById("hide_timer_badge");
-    badgeEl.addEventListener("change", () => this._set("hide_timer_badge", badgeEl.checked));
+    // ── Show timer badge ──
+    const badgeEl = this.shadowRoot.getElementById("show_timer_badge");
+    badgeEl.addEventListener("change", () => this._set("show_timer_badge", badgeEl.checked));
 
     // ── Show/hide toggles ──
     const showToggleEl         = this.shadowRoot.getElementById("show_toggle");
