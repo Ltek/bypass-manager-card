@@ -1,6 +1,6 @@
 {
   "name": "Bypass & Timer Manager Card",
-  "category": "plugin",
+  "type": "plugin",
+  "filename": "bypass-manager-card.js",
   "render_readme": true
-  "screenshot_path": "screenshot.jpg"
 }
