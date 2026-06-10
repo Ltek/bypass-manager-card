@@ -27,7 +27,7 @@
 [![Add to HACS](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=Ltek&category=Integration&repository=https%3A%2F%2Fgithub.com%2FLtek%2Fbypass-manager-card)
 
 1. Click the button above, or go to **HACS → Frontend → ⋮ → Custom repositories**
-2. Add this repo URL with category **Lovelace**
+2. Add this repo URL with category **Dashboard**
 3. Install **Bypass & Timer Manager Card**
 4. Hard-refresh your browser (`Ctrl+Shift+R`)
 
