@@ -16,7 +16,7 @@
 - **Deep appearance customization** — per-element font sizes and colors, secondary info line, theme-aware defaults
 - **Display name cleaning** — strips prefix, group keywords, and custom words automatically
 
-![Bypass & Timer Manager Card](screenshot.jpg)
+![image1](images/screenshot.png)
 
 ---
 
