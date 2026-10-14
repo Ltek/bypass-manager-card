@@ -1,1522 +1,1249 @@
+// Bypass & Timer Manager Card — Home Assistant Dashboard card for bypass switches + timers
+// Version: v2026.10.14.32
+//
+// Finds every bypass input_boolean and timer (by entity-ID prefix or by HA label),
+// pairs each switch with the timer of the same name, groups them by type and gives
+// full timer control. Built for ALL bypasses — security zones, doors, motion, lights,
+// scenes, locks, weather and anything else that follows the naming.
+//
+// Discovery (discovery_mode):
+//   "prefix" (default) — input_boolean.<prefix>* and timer.<prefix>* (prefix default "bypass_").
+//   "label"            — any input_boolean / timer carrying the given HA label.
+//
+// Timer states:
+//   idle    → configured duration (editable), Start
+//   active  → countdown, Pause / Stop / Finish
+//   paused  → remaining time (editable), Start (resume) / Stop / Finish
+//
+// Vanilla JS, single file. The card stylesheet is a constant (no config values are
+// interpolated into it); per-card values are custom properties set inline on the
+// card root. The card renders once and patches itself on every state change.
+
+const BUILD_NUMBER = 'v2026.10.14.32';
+const VERSION = BUILD_NUMBER.slice(1);
+const CARD_TAG = 'bypass-manager-card';
+const EDITOR_TAG = 'bypass-manager-card-editor';
+const DEFAULT_TITLE = 'BYPASS & TIMER MANAGER';
+
+// ---------------------------------------------------------------------------
+// Groups
+// ---------------------------------------------------------------------------
+// [label, keyword, icon, legacy]. legacy = shipped before v32: matched as a plain
+// substring anywhere in the name (as it always was). Newer keywords match only at
+// the start of a word, so "lock" doesn't catch "clock".
+const BUILTIN_GROUPS = [
+  ['Motion', 'motion', 'mdi:motion-sensor', true],
+  ['Door', 'door', 'mdi:door', true],
+  ['Window', 'window', 'mdi:window-open-variant', true],
+  ['Light', 'light', 'mdi:lightbulb', true],
+  ['Lock', 'lock', 'mdi:lock-open-variant', false],
+  ['Scene', 'scene', 'mdi:palette-outline', false],
+  ['Alarm', 'alarm', 'mdi:alarm-bell', false],
+  ['Weather', 'weather', 'mdi:weather-windy', false],
+];
+const OTHER_GROUP = 'Other';
+const OTHER_ICON = 'mdi:shield-off-outline';
+const GROUP_ORDER = [...BUILTIN_GROUPS.map((g) => g[0]), OTHER_GROUP];
+// The groups v31 knew about: what a legacy `type_filters` list could choose between.
+const LEGACY_GROUPS = ['Motion', 'Door', 'Window', 'Light', 'Other'];
+
+function customLabels(customTypes) {
+  return (customTypes || []).map((t) => t && t.label).filter((l) => l && !GROUP_ORDER.includes(l));
+}
+
+function allGroups(customTypes) {
+  return [...GROUP_ORDER, ...customLabels(customTypes)];
+}
+
+/** Position of a keyword in a name, or -1. Legacy keywords match anywhere; newer ones at a word start. */
+function keywordPos(s, kw, legacy) {
+  if (legacy) return s.indexOf(kw);
+  const m = new RegExp(`(^|_)${kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`).exec(s);
+  return m ? m.index + m[1].length : -1;
+}
+
 /**
- * Bypass Manager Card
- *
- * Two discovery modes (discovery_mode):
- *   "prefix" (default) — finds all input_boolean.<prefix>* and timer.<prefix>* entities.
- *   "label"            — finds all input_boolean.* and timer.* that carry a given HA label.
- *
- * In prefix mode the entity_prefix (default "bypass_") is stripped to derive the suffix used
- * for pairing and grouping. In label mode the full object_id (after the domain dot) is used
- * as the suffix, and friendly_name is used for display when available.
- * Pairs them by matching suffix. Unpaired entities show as solo rows.
- *
- * Timer states:
- *   idle    → shows configured duration, Start button
- *   active  → shows countdown, Pause / Cancel / Finish + +/- buttons
- *   paused  → shows remaining time, Start (resume) / Cancel / Finish + +/- buttons
+ * Which group a name belongs to → { label, keyword, icon }.
+ * Custom groups win (as they always have). Otherwise the built-in keyword that appears
+ * FIRST in the name wins, so lock_front_door is a Lock and door_alarm is a Door.
  */
+function groupFor(suffix, customTypes) {
+  const s = String(suffix).toLowerCase();
+  for (const ct of customTypes || []) {
+    if (ct && ct.keyword && ct.label && s.includes(ct.keyword.toLowerCase())) {
+      return { label: ct.label, keyword: ct.keyword.toLowerCase(), icon: ct.icon || OTHER_ICON };
+    }
+  }
+  let best = null;
+  for (const [label, kw, icon, legacy] of BUILTIN_GROUPS) {
+    const p = keywordPos(s, kw, legacy);
+    if (p >= 0 && (!best || p < best.p)) best = { p, label, keyword: kw, icon };
+  }
+  return best ? { label: best.label, keyword: best.keyword, icon: best.icon } : { label: OTHER_GROUP, keyword: null, icon: OTHER_ICON };
+}
 
-const VERSION = "2026.05.23.31";
-
-const GROUP_ORDER = ["Motion", "Door", "Window", "Light", "Other"];
-// INCREMENT_STEP is now read from config (increment_step + increment_unit).
-// Helper: resolve config → seconds at runtime (called wherever the step is needed).
+/** Display name: drop the strip words and (optionally) the group keyword, then Title Case. */
+function cleanDisplayName(suffix, stripWords, stripGroup, customTypes) {
+  const words = String(suffix).split('_').filter(Boolean);
+  const remove = new Set((stripWords || []).map((w) => String(w).toLowerCase()));
+  if (stripGroup !== false) {
+    const g = groupFor(suffix, customTypes);
+    if (g.keyword) remove.add(g.keyword);
+  }
+  const kept = words.filter((w) => !remove.has(w.toLowerCase()));
+  return (kept.length ? kept : words).map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+}
 
 function suffixOf(entityId, prefix) {
-  const p = (prefix || "bypass_").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const p = (prefix || 'bypass_').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const m = entityId.match(new RegExp(`^(?:input_boolean|timer)\\.${p}(.+)$`));
   return m ? m[1] : null;
 }
 
-// customTypes: array of { keyword, label } from config
-function allGroups(customTypes) {
-  return [...GROUP_ORDER, ...(customTypes || []).map(t => t.label).filter(l => l && !GROUP_ORDER.includes(l))];
+function labelSlug(label) {
+  return String(label || '').toLowerCase().replace(/\s+/g, '_');
 }
 
-function groupForSuffix(suffix, customTypes) {
-  const s = suffix.toLowerCase();
-  // Check custom types first so they can shadow built-ins if desired
-  for (const ct of (customTypes || [])) {
-    if (ct.keyword && s.includes(ct.keyword.toLowerCase())) return ct.label;
-  }
-  if (s.includes("motion"))  return "Motion";
-  if (s.includes("door"))    return "Door";
-  if (s.includes("window"))  return "Window";
-  if (s.includes("light"))   return "Light";
-  return "Other";
+// Labels live on hass.entities[id].labels. "bypass" matches bypass, bypass_helper, …
+function entityHasLabel(hassEntities, entityId, targetSlug) {
+  const labels = (hassEntities && hassEntities[entityId] && hassEntities[entityId].labels) || [];
+  return labels.some((l) => { const ls = labelSlug(l); return ls === targetSlug || ls.startsWith(targetSlug); });
 }
+
+/** Find the bypass switches and timers → [{ suffix, bool, timer }]. */
+function discover(hass, c) {
+  const booleans = {};
+  const timers = {};
+  const states = (hass && hass.states) || {};
+  if (c.discovery_mode === 'label') {
+    const slug = labelSlug(c.discovery_label || 'bypass');
+    for (const id of Object.keys(states)) {
+      if (!entityHasLabel(hass.entities, id, slug)) continue;
+      if (id.startsWith('input_boolean.')) booleans[id.slice(14)] = id;
+      else if (id.startsWith('timer.')) timers[id.slice(6)] = id;
+    }
+  } else {
+    const pfx = c.entity_prefix || 'bypass_';
+    for (const id of Object.keys(states)) {
+      const suffix = suffixOf(id, pfx);
+      if (!suffix) continue;
+      if (id.startsWith(`input_boolean.${pfx}`)) booleans[suffix] = id;
+      else if (id.startsWith(`timer.${pfx}`)) timers[suffix] = id;
+    }
+  }
+  return [...new Set([...Object.keys(booleans), ...Object.keys(timers)])]
+    .map((suffix) => ({ suffix, bool: booleans[suffix] || null, timer: timers[suffix] || null }));
+}
+
+/** On = the switch is on; a timer-only row is on while its timer runs. */
+function rowIsOn(hass, row) {
+  const st = (id) => id && hass && hass.states[id] && hass.states[id].state;
+  return row.bool ? st(row.bool) === 'on' : st(row.timer) === 'active';
+}
+
+function rowChanged(hass, row) {
+  const s = hass && hass.states[row.bool || row.timer];
+  const t = s ? new Date(s.last_changed).getTime() : 0;
+  return Number.isFinite(t) ? t : 0;
+}
+
+/** Discovered rows → visible sections [{ section, rows }], grouped, filtered and sorted. */
+function buildSections(hass, c) {
+  const custom = c.custom_types || [];
+  const hidden = new Set(c.hidden_types || []);
+  const strip = c.strip_words || ['bypass'];
+  const rows = discover(hass, c).map((r) => {
+    const g = groupFor(r.suffix, custom);
+    return { ...r, group: g.label, icon: g.icon, label: cleanDisplayName(r.suffix, strip, c.strip_group_word, custom) };
+  }).filter((r) => !hidden.has(r.group));
+  const byName = (a, b) => a.label.localeCompare(b.label);
+  const sorter = c.sort === 'active'
+    ? (a, b) => (rowIsOn(hass, b) - rowIsOn(hass, a)) || (rowChanged(hass, b) - rowChanged(hass, a)) || byName(a, b)
+    : byName;
+  if (c.group_rows === false) return rows.length ? [{ section: '', rows: rows.sort(sorter) }] : [];
+  return allGroups(custom)
+    .map((g) => ({ section: g, rows: rows.filter((r) => r.group === g).sort(sorter) }))
+    .filter((s) => s.rows.length);
+}
+
+// ---------------------------------------------------------------------------
+// Config
+// ---------------------------------------------------------------------------
+const BTN_KEYS = ['show_btn_start', 'show_btn_pause', 'show_btn_stop', 'show_btn_finish'];
+const DEFAULTS = {
+  title: DEFAULT_TITLE,
+  discovery_mode: 'prefix',
+  entity_prefix: 'bypass_',
+  discovery_label: 'bypass',
+  sort: 'name',
+  group_rows: true,
+  show_group_labels: true,
+  show_dividers: true,
+  show_icon: false,
+  show_entity_names: true,
+  show_toggle: true,
+  show_timer_badge: false,
+  show_timer_input: true,
+  show_countdown: true,
+  show_btn_start: true,
+  show_btn_pause: true,
+  show_btn_stop: true,
+  show_btn_finish: true,
+  show_button_labels: false,
+  show_duration: false,
+  show_last_changed: false,
+  show_exact_time: false,
+  show_active_count: false,
+  glow_when_active: false,
+  strip_group_word: true,
+  increment_step: 1,
+  increment_unit: 'minutes',
+  secondary_info_text: '',
+  font_size_title: 13,
+  font_size_name: 14,
+  font_size_group: 11,
+  font_size_timer: 13,
+  secondary_info_size: 11,
+  font_size_last_changed: 11,
+  icon_size: 20,
+};
+// key, label, "unset" label, seed hex, fallback CSS used by the card
+const COLOR_DEFS = [
+  ['color_card_title', 'Title', 'Theme secondary text', '#9e9e9e', 'var(--secondary-text-color)'],
+  ['secondary_info_color', 'Secondary text', 'Theme primary', '#03a9f4', 'var(--primary-color)'],
+  ['active_color', 'On (name + switch)', 'Theme primary', '#03a9f4', 'var(--primary-color)'],
+  ['color_entity_off', 'Off name', 'Theme text', '#e1e1e1', 'var(--primary-text-color)'],
+  ['color_group_label', 'Group title', 'Theme secondary text', '#9e9e9e', 'var(--secondary-text-color)'],
+  ['color_divider', 'Divider', 'Theme divider', '#e0e0e0', 'var(--divider-color)'],
+  ['icon_color_on', 'Icon when on', 'Theme success (green)', '#4caf50', 'var(--success-color, #4caf50)'],
+  ['icon_color_off', 'Icon when off', 'Theme disabled (grey)', '#757575', 'var(--disabled-text-color, #757575)'],
+  ['color_last_changed', 'Last changed', 'Theme secondary text', '#9e9e9e', 'var(--secondary-text-color)'],
+];
+const COLOR_KEYS = COLOR_DEFS.map((d) => d[0]);
+const SIZE_DEFS = [ // key, label, min, max
+  ['font_size_title', 'Title', 8, 32],
+  ['secondary_info_size', 'Secondary text', 8, 32],
+  ['font_size_name', 'Names', 8, 32],
+  ['font_size_group', 'Group titles', 8, 24],
+  ['font_size_timer', 'Countdown / time', 8, 32],
+  ['font_size_last_changed', 'Last changed', 8, 24],
+  ['icon_size', 'Icons', 12, 40],
+];
+
+const isDefault = (key, v) => {
+  const d = DEFAULTS[key];
+  if (d === undefined) return false;
+  return typeof d === 'number' ? Number(v) === d : v === d;
+};
 
 /**
- * Core display-name cleaner used by both prefix and label discovery modes.
- *
- * @param {string}   suffix        - Object-ID fragment (after prefix stripped, or full object_id)
- * @param {string[]} stripWords    - Words to remove regardless of position (lowercased comparison)
- * @param {boolean}  stripGroup    - Whether to also remove the group keyword for this suffix
- * @param {Array}    customTypes   - Custom type definitions [{ keyword, label }]
+ * Migrate legacy keys and drop values equal to the default. Idempotent; never touches
+ * keys it doesn't know (type, card_mod, …).
+ *   type_filters (groups to SHOW, v31) → hidden_types (groups to HIDE). Groups added
+ *     later are shown, so a card made before them picks them up.
+ *   show_timer_controls: false → the four per-button switches off.
  */
-function cleanDisplayName(suffix, stripWords, stripGroup, customTypes) {
-  const words = suffix.split("_");
-
-  // Build the full remove-set: user strip words + optionally the group keyword
-  const removeSet = new Set((stripWords || []).map(w => w.toLowerCase()));
-  if (stripGroup !== false) {
-    // Find which group keyword applies to this suffix
-    const s = suffix.toLowerCase();
-    const builtinKeywords = ["motion", "door", "window", "light"];
-    for (const ct of (customTypes || [])) {
-      if (ct.keyword && s.includes(ct.keyword.toLowerCase())) {
-        removeSet.add(ct.keyword.toLowerCase()); break;
-      }
-    }
-    for (const k of builtinKeywords) {
-      if (s.includes(k)) { removeSet.add(k); break; }
-    }
+function normalizeConfig(raw) {
+  const c = { ...(raw || {}) };
+  if (Array.isArray(c.type_filters)) {
+    const shown = new Set(c.type_filters);
+    const legacy = [...LEGACY_GROUPS, ...customLabels(c.custom_types)];
+    const hidden = [...new Set([...(c.hidden_types || []), ...legacy.filter((g) => !shown.has(g))])];
+    if (hidden.length) c.hidden_types = hidden;
   }
-
-  const filtered = words.filter(w => !removeSet.has(w.toLowerCase()));
-  // If every word was stripped, fall back to the full suffix title-cased
-  const result = filtered.length > 0 ? filtered : words;
-  return result.map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(" ");
+  delete c.type_filters;
+  if (c.show_timer_controls === false) BTN_KEYS.forEach((k) => { if (c[k] === undefined) c[k] = false; });
+  delete c.show_timer_controls;
+  for (const k of Object.keys(DEFAULTS)) if (k in c && (c[k] === null || isDefault(k, c[k]))) delete c[k];
+  for (const k of COLOR_KEYS) if (k in c && (c[k] === '' || c[k] == null)) delete c[k];
+  for (const k of ['hidden_types', 'custom_types']) if (Array.isArray(c[k]) && !c[k].length) delete c[k];
+  if (Array.isArray(c.strip_words) && c.strip_words.length === 1 && c.strip_words[0] === 'bypass') delete c.strip_words;
+  return c;
 }
 
-// Backwards-compatible wrapper used by prefix mode (strip_words + strip_group come from config)
-function labelFromSuffix(suffix, customTypes, stripWords, stripGroup) {
-  return cleanDisplayName(suffix, stripWords, stripGroup, customTypes);
-}
+/** Config value with its default applied. */
+const cfg = (c, key) => (c[key] !== undefined ? c[key] : DEFAULTS[key]);
 
-// Normalise a string to the slug format HA uses for label IDs (lowercase, spaces→underscores)
-function labelSlug(label) {
-  return (label || "").toLowerCase().replace(/\s+/g, "_");
-}
-
-// Returns true if any of the entity's label IDs match the target slug.
-// HA stores label IDs on hass.entities[id].labels (not on hass.states).
-// Matching: the target slug must equal a label ID, or a label ID must start
-// with the target slug (so "bypass" matches "bypass_helper", "bypass_timer", etc.)
-function entityHasLabel(hassEntities, entityId, targetSlug) {
-  const entityLabels = hassEntities?.[entityId]?.labels ?? [];
-  return entityLabels.some(l => {
-    const ls = labelSlug(l);
-    return ls === targetSlug || ls.startsWith(targetSlug);
-  });
-}
-
-// For label-mode: derive a human-readable name from the object_id, stripping
-// group keywords (motion, door, window, light + any custom keywords) exactly
-// as labelFromSuffix does. friendly_name is intentionally NOT used here —
-// it is often set to the full unstripped name (e.g. "Motion Front Door") and
-// would undo the cleaning. The object_id is the reliable, consistent source.
-function labelFromEntityId(entityId, hassState, customTypes, stripWords, stripGroup) {
-  const obj = entityId.replace(/^[^.]+\./, ""); // strip domain
-  return cleanDisplayName(obj, stripWords, stripGroup, customTypes);
-}
-
-function buildRows(hassStates, hassEntities, allowedGroups, customTypes, prefix, discoveryMode, discoveryLabel, stripWords, stripGroup) {
-  const booleans = {}; // suffix → entity id
-  const timers   = {}; // suffix → entity id
-  const labels   = {}; // suffix → display label (for label-mode)
-
-  if (discoveryMode === "label") {
-    // Label-based discovery: scan input_boolean.* and timer.* for entities carrying the label.
-    // Labels live on hass.entities[id].labels (array of label ID strings), NOT on hass.states.
-    // hassEntities is passed in as the hass.entities map.
-    const targetSlug = labelSlug(discoveryLabel || "bypass");
-    Object.keys(hassStates).forEach(id => {
-      if (!entityHasLabel(hassEntities, id, targetSlug)) return;
-      const state = hassStates[id];
-      if (id.startsWith("input_boolean.")) {
-        const suffix = id.slice("input_boolean.".length);
-        booleans[suffix] = id;
-        labels[suffix]   = labelFromEntityId(id, state, customTypes, stripWords, stripGroup);
-      } else if (id.startsWith("timer.")) {
-        const suffix = id.slice("timer.".length);
-        timers[suffix] = id;
-        if (!labels[suffix]) labels[suffix] = labelFromEntityId(id, state, customTypes, stripWords, stripGroup);
-      }
-    });
-    // For pairs, prefer the boolean's friendly name; fill in from timer if bool absent
-    Object.keys(timers).forEach(s => {
-      if (!labels[s]) {
-        const state = hassStates[timers[s]];
-        labels[s] = labelFromEntityId(timers[s], state, customTypes, stripWords, stripGroup);
-      }
-    });
-  } else {
-    // Prefix-based discovery (default)
-    const pfx = prefix || "bypass_";
-    Object.keys(hassStates).forEach(id => {
-      const suffix = suffixOf(id, pfx);
-      if (!suffix) return;
-      if (id.startsWith(`input_boolean.${pfx}`)) booleans[suffix] = id;
-      if (id.startsWith(`timer.${pfx}`))         timers[suffix]   = id;
-    });
-  }
-
-  const order  = allGroups(customTypes);
-  const groups = {};
-  order.forEach(g => (groups[g] = []));
-
-  const allSuffixes = new Set([...Object.keys(booleans), ...Object.keys(timers)]);
-  allSuffixes.forEach(suffix => {
-    const group = groupForSuffix(suffix, customTypes);
-    if (!groups[group]) groups[group] = [];
-    // In label mode use the pre-computed friendly label; in prefix mode derive from suffix
-    const displayLabel = discoveryMode === "label"
-      ? (labels[suffix] || suffix)
-      : labelFromSuffix(suffix, customTypes, stripWords, stripGroup);
-    groups[group].push({
-      label: displayLabel,
-      bool:  booleans[suffix] || null,
-      timer: timers[suffix]   || null,
-    });
-  });
-
-  order.forEach(g => groups[g].sort((a, b) => a.label.localeCompare(b.label)));
-  const visible = allowedGroups && allowedGroups.length > 0 ? allowedGroups : order;
-  return order.filter(g => visible.includes(g) && groups[g] && groups[g].length > 0)
-              .map(g => ({ section: g, rows: groups[g] }));
-}
-
-// Parse "H:MM:SS" or "HH:MM:SS" duration string → seconds
+// ---------------------------------------------------------------------------
+// Time helpers
+// ---------------------------------------------------------------------------
 function durationToSecs(dur) {
   if (!dur) return 0;
-  const parts = dur.split(":").map(Number);
+  const parts = String(dur).split(':').map(Number);
+  if (parts.some((n) => !Number.isFinite(n))) return 0;
   if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
   if (parts.length === 2) return parts[0] * 60 + parts[1];
   return 0;
 }
 
-// Seconds → "HH:MM:SS" for service calls
 function secsToHMS(secs) {
-  secs = Math.max(0, secs);
-  return [
-    String(Math.floor(secs / 3600)).padStart(2, "0"),
-    String(Math.floor((secs % 3600) / 60)).padStart(2, "0"),
-    String(secs % 60).padStart(2, "0"),
-  ].join(":");
+  secs = Math.max(0, Math.round(secs));
+  return [Math.floor(secs / 3600), Math.floor((secs % 3600) / 60), secs % 60].map((n) => String(n).padStart(2, '0')).join(':');
 }
 
-// Seconds → human-readable display — always includes seconds so sub-minute
-// timers are legible: "1h 05m 30s" / "5m 30s" / "45s"
+// "1h 05m 30s" / "5m 30s" / "45s" — the live countdown and the editable time
 function fmtSecs(secs) {
-  secs = Math.max(0, secs);
+  secs = Math.max(0, Math.round(secs));
   const h = Math.floor(secs / 3600);
   const m = Math.floor((secs % 3600) / 60);
   const s = secs % 60;
-  if (h > 0) return `${h}h ${String(m).padStart(2, "0")}m ${String(s).padStart(2, "0")}s`;
-  if (m > 0) return `${m}m ${String(s).padStart(2, "0")}s`;
+  if (h > 0) return `${h}h ${String(m).padStart(2, '0')}m ${String(s).padStart(2, '0')}s`;
+  if (m > 0) return `${m}m ${String(s).padStart(2, '0')}s`;
   return `${s}s`;
 }
 
-// Format a last-changed timestamp (ISO string or Date) as a relative time string
-// e.g. "just now", "2m ago", "1h 15m ago", "3d ago"
-function fmtRelTime(isoStr) {
-  if (!isoStr) return "—";
-  const diffMs = Date.now() - new Date(isoStr).getTime();
-  if (isNaN(diffMs) || diffMs < 0) return "—";
-  const s = Math.floor(diffMs / 1000);
-  if (s < 10)  return "just now";
-  if (s < 60)  return `${s}s ago`;
-  const m = Math.floor(s / 60);
-  if (m < 60)  return `${m}m ago`;
-  const h = Math.floor(m / 60);
-  const rm = m % 60;
-  if (h < 24)  return rm > 0 ? `${h}h ${rm}m ago` : `${h}h ago`;
-  const d = Math.floor(h / 24);
-  return `${d}d ago`;
+// "1h 30m" / "5m" / "45s" — the Duration column (configured length, not a countdown)
+function fmtDuration(secs) {
+  secs = Math.max(0, Math.round(secs));
+  if (!secs) return '—';
+  const h = Math.floor(secs / 3600);
+  const m = Math.floor((secs % 3600) / 60);
+  const s = secs % 60;
+  return [h && `${h}h`, m && `${m}m`, s && `${s}s`].filter(Boolean).join(' ');
 }
 
-// Parse user-typed duration string → seconds
-function parseInput(raw) {
-  if (!raw) return 0;
-  raw = raw.trim();
-  let secs = 0;
-  const hm     = raw.match(/^(\d+)h\s*(\d+)m$/i);
-  const honly  = raw.match(/^(\d+)h$/i);
-  const minsec = raw.match(/^(\d+)m\s*(\d+)s$/i);
-  const monly  = raw.match(/^(\d+)m$/i);
-  const sonly  = raw.match(/^(\d+)s$/i);
-  const plain  = raw.match(/^(\d+)$/);
-  if      (hm)     secs = parseInt(hm[1]) * 3600 + parseInt(hm[2]) * 60;
-  else if (honly)  secs = parseInt(honly[1]) * 3600;
-  else if (minsec) secs = parseInt(minsec[1]) * 60 + parseInt(minsec[2]);
-  else if (monly)  secs = parseInt(monly[1]) * 60;
-  else if (sonly)  secs = parseInt(sonly[1]);
-  else if (plain)  secs = parseInt(plain[1]) * 60;
-  return secs;
+function fmtRelTime(iso, now = Date.now()) {
+  if (!iso) return '—';
+  const diff = now - new Date(iso).getTime();
+  if (!Number.isFinite(diff) || diff < 0) return '—';
+  const s = Math.floor(diff / 1000);
+  if (s < 10) return 'just now';
+  if (s < 60) return `${s}s ago`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return m % 60 ? `${h}h ${m % 60}m ago` : `${h}h ago`;
+  return `${Math.floor(h / 24)}d ago`;
 }
+
+// Clock time of a change: "3:41 PM" today, "Oct 12, 3:41 PM" before that
+function fmtClock(iso, now = Date.now()) {
+  const d = new Date(iso);
+  if (!iso || !Number.isFinite(d.getTime())) return '';
+  const time = d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  return d.toDateString() === new Date(now).toDateString()
+    ? time : `${d.toLocaleDateString([], { month: 'short', day: 'numeric' })}, ${time}`;
+}
+
+// Typed duration → seconds: 30 / 30m, 90s, 1h, 1h30m, 2m30s
+function parseInput(raw) {
+  raw = String(raw || '').trim();
+  let m;
+  if ((m = raw.match(/^(\d+)h\s*(\d+)m$/i))) return +m[1] * 3600 + +m[2] * 60;
+  if ((m = raw.match(/^(\d+)h$/i))) return +m[1] * 3600;
+  if ((m = raw.match(/^(\d+)m\s*(\d+)s$/i))) return +m[1] * 60 + +m[2];
+  if ((m = raw.match(/^(\d+)m$/i))) return +m[1] * 60;
+  if ((m = raw.match(/^(\d+)s$/i))) return +m[1];
+  if ((m = raw.match(/^(\d+)$/))) return +m[1] * 60;
+  return 0;
+}
+
+const cssEsc = (s) => (typeof CSS !== 'undefined' && CSS.escape ? CSS.escape(s) : String(s).replace(/["\\]/g, '\\$&'));
+const esc = (s) => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 
 // ---------------------------------------------------------------------------
+// Card
+// ---------------------------------------------------------------------------
+const CARD_CSS = `
+  :host { display: block; font-family: var(--primary-font-family, sans-serif); }
+  ha-card.card { padding: 12px 0 8px; display: grid; grid-template-columns: var(--bm-cols, 1fr); align-items: center;
+    column-gap: 12px; transition: box-shadow .2s ease; }
+  ha-card.card.glow { box-shadow: 0 3px 10px color-mix(in srgb, var(--bm-c-active) 80%, transparent); }
+  .head { grid-column: 1 / -1; display: flex; align-items: center; gap: 8px; padding: 0 16px 4px; min-height: 18px; }
+  .card-title { flex: 1 1 auto; min-width: 0; font-size: var(--bm-fs-title); font-weight: 600; letter-spacing: .05em; color: var(--bm-c-title);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .count { flex: none; font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 10px; white-space: nowrap;
+    color: var(--secondary-text-color); border: 1px solid var(--divider-color); }
+  .count.on { color: var(--bm-c-active); border-color: var(--bm-c-active); }
+  .card-secondary { grid-column: 1 / -1; font-size: var(--bm-fs-sec); font-weight: 500; color: var(--bm-c-sec); padding: 0 16px 8px; }
+  .section-label { grid-column: 1 / -1; font-size: var(--bm-fs-group); font-weight: 600; text-transform: uppercase; letter-spacing: .06em;
+    color: var(--bm-c-group); opacity: .7; padding: 10px 16px 4px; }
+  .divider { grid-column: 1 / -1; height: 1px; background: var(--bm-c-divider); margin: 4px 16px; opacity: .5; }
+  .empty { grid-column: 1 / -1; padding: 8px 16px; color: var(--secondary-text-color); font-size: 13px; }
+
+  .row { display: contents; }
+  .row > span { padding: 5px 0; min-width: 0; }
+  .row:hover > span { background: var(--secondary-background-color); }
+  .row.solo-timer > span { opacity: .75; }
+  .col-first { padding-left: 16px !important; }
+  .col-last { padding-right: 16px !important; }
+
+  .col-icon { display: flex; align-items: center; }
+  .icon-btn { border: none; background: none; padding: 0; margin: 0; cursor: pointer; line-height: 0; color: var(--bm-c-icon-off); }
+  .icon-btn ha-icon { --mdc-icon-size: var(--bm-icon); width: var(--bm-icon); height: var(--bm-icon); }
+  .row.active .icon-btn { color: var(--bm-c-icon-on); }
+
+  .col-name { font-size: var(--bm-fs-name); color: var(--bm-c-off); font-weight: 400; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: pointer; }
+  .row.active .col-name { color: var(--bm-c-active); font-weight: 700; }
+
+  .col-btns { display: flex; justify-content: flex-start; }
+  .timer-btns { display: inline-flex; gap: 6px; }
+  .col-time { display: flex; }
+  .timer-input-wrap { display: inline-flex; align-items: center; gap: 4px; }
+  .timer-input { height: 26px; width: 80px; font-size: 12px; padding: 0 6px; border: 1px solid var(--divider-color); border-radius: 6px;
+    background: var(--card-background-color); color: var(--primary-text-color); text-align: center; }
+  .timer-input:focus { outline: none; border-color: var(--primary-color); }
+  .timer-input.paused { border-color: var(--warning-color, #f4b942); color: var(--warning-color, #f4b942); }
+  .countdown { font-size: var(--bm-fs-timer); font-family: var(--paper-font-code_-_font-family, monospace); font-weight: 600; min-width: 80px;
+    text-align: center; display: inline-block; color: var(--primary-color); }
+  .countdown.paused { color: var(--warning-color, #f4b942); }
+  .col-dur { font-size: 12px; font-weight: 600; color: var(--secondary-text-color); white-space: nowrap; cursor: pointer; text-align: right; }
+  .row.timing .col-dur { color: var(--primary-color); }
+
+  .btn { height: 26px; padding: 0 8px; font-size: 11px; font-weight: 500; border: none; border-radius: 6px; cursor: pointer; white-space: nowrap;
+    transition: opacity .15s; line-height: 26px; }
+  .btn:active { opacity: .7; }
+  .btn-adj { width: 26px; padding: 0; text-align: center; background: var(--secondary-background-color); color: var(--primary-text-color);
+    font-size: 16px; line-height: 24px; }
+  .btn-start { background: var(--primary-color); color: var(--text-primary-color, #fff); }
+  .btn-pause { background: var(--warning-color, #f4b942); color: #000; }
+  .btn-stop { background: var(--error-color, #db4437); color: #fff; }
+  .btn-finish { background: var(--success-color, #43a047); color: #fff; }
+
+  .solo-timer-badge { font-size: 10px; color: var(--disabled-text-color, var(--secondary-text-color)); font-style: italic; padding-right: 4px; }
+  ha-switch { --mdc-theme-secondary: var(--bm-c-active); --switch-checked-color: var(--bm-c-active); }
+  .row-last-changed { grid-column: 1 / -1; font-size: var(--bm-fs-lc); color: var(--bm-c-lc); padding: 0 16px 6px; display: flex; gap: 16px; flex-wrap: wrap; }
+  .lc-clock { opacity: .8; }
+`;
+
+/** The per-card values, as custom properties on the card root (the stylesheet never changes). */
+function rootStyleVars(c, cols) {
+  const color = (key) => { const d = COLOR_DEFS.find((x) => x[0] === key); return c[key] || d[4]; };
+  const px = (key) => `${Number(cfg(c, key))}px`;
+  return [
+    `--bm-cols:${cols}`,
+    `--bm-fs-title:${px('font_size_title')}`, `--bm-fs-sec:${px('secondary_info_size')}`, `--bm-fs-name:${px('font_size_name')}`,
+    `--bm-fs-group:${px('font_size_group')}`, `--bm-fs-timer:${px('font_size_timer')}`, `--bm-fs-lc:${px('font_size_last_changed')}`,
+    `--bm-icon:${px('icon_size')}`,
+    `--bm-c-title:${color('color_card_title')}`, `--bm-c-sec:${color('secondary_info_color')}`, `--bm-c-active:${color('active_color')}`,
+    `--bm-c-off:${color('color_entity_off')}`, `--bm-c-group:${color('color_group_label')}`, `--bm-c-divider:${color('color_divider')}`,
+    `--bm-c-icon-on:${color('icon_color_on')}`, `--bm-c-icon-off:${color('icon_color_off')}`, `--bm-c-lc:${color('color_last_changed')}`,
+  ].join(';');
+}
+
+/** Which columns the card shows, in order. */
+function columns(c) {
+  const btns = BTN_KEYS.some((k) => cfg(c, k));
+  return [
+    cfg(c, 'show_icon') && ['icon', 'max-content'],
+    cfg(c, 'show_entity_names') && ['name', '1fr'],
+    btns && ['btns', 'max-content'],
+    (cfg(c, 'show_timer_input') || cfg(c, 'show_countdown')) && ['time', 'max-content'],
+    cfg(c, 'show_duration') && ['dur', 'max-content'],
+    cfg(c, 'show_toggle') && ['toggle', 'max-content'],
+  ].filter(Boolean);
+}
 
 class BypassManagerCard extends HTMLElement {
   constructor() {
     super();
-    this._hass        = null;
-    this._interval    = null;
-    this._finishTimes = {};   // timerEntity → epoch ms (when active)
-    this._pausedSecs  = {};   // timerEntity → remaining seconds (when paused)
-    this._inputSecs   = {};   // timerEntity → pending seconds in input field
-    this._rows        = null;
-    this.attachShadow({ mode: "open" });
-  }
-
-  // ── Config helpers ────────────────────────────────────────────────────────
-
-  /** Returns the configured +/- step in seconds (default: 60s = 1 minute). */
-  _incrementSecs() {
-    const cfg   = this._config ?? {};
-    const value = Number(cfg.increment_step ?? 1);
-    const unit  = cfg.increment_unit ?? "minutes";
-    if (unit === "hours")   return value * 3600;
-    if (unit === "seconds") return value;
-    return value * 60; // minutes (default)
-  }
-
-  // ── Optimistic state helpers ──────────────────────────────────────────────
-
-  /**
-   * Immediately mirror a timer state change in local caches so _tick()
-   * reflects the new state without waiting for the HA websocket update.
-   * @param {string} timerId
-   * @param {"active"|"paused"|"idle"} newState
-   * @param {number} [remSecs]  remaining seconds (required for active/paused)
-   */
-  _optimisticTimerState(timerId, newState, remSecs) {
-    if (newState === "active") {
-      this._finishTimes[timerId] = Date.now() + (remSecs ?? 0) * 1000;
-      delete this._pausedSecs[timerId];
-    } else if (newState === "paused") {
-      this._pausedSecs[timerId] = remSecs ?? 0;
-      delete this._finishTimes[timerId];
-    } else {
-      delete this._finishTimes[timerId];
-      delete this._pausedSecs[timerId];
-    }
-    // Patch the local hass states cache so _tick()'s state reads agree.
-    if (this._hass?.states[timerId]) {
-      this._hass = {
-        ...this._hass,
-        states: {
-          ...this._hass.states,
-          [timerId]: { ...this._hass.states[timerId], state: newState },
-        },
-      };
-    }
-    this._tick();
+    this._hass = null;
+    this._config = {};
+    this._interval = null;
+    this._throttle = null;
+    this._finishTimes = {}; // timer → epoch ms (active)
+    this._pausedSecs = {};  // timer → remaining seconds (paused)
+    this._inputSecs = {};   // timer → seconds typed / stepped while idle
+    this._sections = [];
+    this._sig = '';
+    this.attachShadow({ mode: 'open' });
   }
 
   setConfig(config) {
-    this._config = config;
-    this._showBtnLabels     = config.show_button_labels  === true;  // default: icons only
-    this._showToggle        = config.show_toggle         !== false; // default: true
-    this._showTimerInput    = config.show_timer_input    !== false; // default: true
-    this._showTimerControls = config.show_timer_controls !== false; // default: true
-    this._showEntityNames   = config.show_entity_names   !== false; // default: true
-    this._showLastChanged   = config.show_last_changed   === true;  // default: false
-    this._entityPrefix      = config.entity_prefix       ?? "bypass_";
-    this._discoveryMode     = config.discovery_mode      ?? "prefix";
-    this._discoveryLabel    = config.discovery_label     ?? "bypass";
+    if (!config) throw new Error('Invalid configuration');
+    this._config = normalizeConfig(config);
+    if (this._hass) this._render();
   }
 
   set hass(hass) {
-    const firstSet = !this._hass;
+    const first = !this._hass;
     this._hass = hass;
-    if (firstSet) {
-      this._rows = buildRows(hass.states, hass.entities, this._config?.type_filters, this._config?.custom_types, this._config?.entity_prefix, this._config?.discovery_mode, this._config?.discovery_label, this._config?.strip_words ?? ["bypass"], this._config?.strip_group_word !== false);
-      this._render();
-      this._startTick();
-    } else {
-      this._updateStates();
-    }
-    this._syncTimerTimes();
+    if (first) { this._render(); this._startTick(); return; }
+    if (this._throttle) return;
+    this._throttle = setTimeout(() => { this._throttle = null; this._update(); }, 250);
   }
 
-  // ── Timer sync ───────────────────────────────────────────────────────────
+  connectedCallback() { if (this._hass && !this._interval) this._startTick(); }
 
-  _syncTimerTimes() {
-    if (!this._hass || !this._rows) return;
-    this._allTimers().forEach(timerId => {
-      const ts = this._hass.states[timerId];
-      if (!ts) return;
-      if (ts.state === "active" && ts.attributes.finishes_at) {
-        this._finishTimes[timerId] = new Date(ts.attributes.finishes_at).getTime();
-        delete this._pausedSecs[timerId];
-      } else if (ts.state === "paused") {
-        const rem = durationToSecs(ts.attributes.remaining);
-        this._pausedSecs[timerId] = rem;
-        delete this._finishTimes[timerId];
-      } else {
-        delete this._finishTimes[timerId];
-        delete this._pausedSecs[timerId];
-      }
-    });
+  disconnectedCallback() {
+    if (this._interval) clearInterval(this._interval);
+    this._interval = null;
+    if (this._throttle) clearTimeout(this._throttle);
+    this._throttle = null;
   }
 
-  _allTimers() {
-    if (!this._rows) return [];
-    return this._rows.flatMap(s => s.rows.map(r => r.timer).filter(Boolean));
+  getCardSize() {
+    return this._sections.length ? this._sections.reduce((n, s) => n + s.rows.length, 0) + this._sections.length : 3;
   }
 
-  // ── Tick ─────────────────────────────────────────────────────────────────
+  static getConfigElement() { return document.createElement(EDITOR_TAG); }
 
-  _startTick() { this._interval = setInterval(() => this._tick(), 1000); }
+  static getStubConfig() { return {}; }
 
-  _tick() {
-    if (!this._rows) return;
-    const now = Date.now();
-    this._allTimers().forEach(timerId => {
-      const inp       = this.shadowRoot.querySelector(`[data-input="${timerId}"]`);
-      const cdEl      = this.shadowRoot.querySelector(`[data-countdown="${timerId}"]`);
-      const adjBtns   = this.shadowRoot.querySelectorAll(`[data-adj="${timerId}"]`);
-      const timerBtns = this.shadowRoot.querySelector(`[data-timer-btns="${timerId}"]`);
-      const ts        = this._hass && this._hass.states[timerId];
-      if (!ts) return;
+  // ── Config helpers ──────────────────────────────────────────────────────
+  _c(key) { return cfg(this._config, key); }
 
-      const state = ts.state; // idle | active | paused
-
-      if (state === "active") {
-        // Hide editable input + adj buttons; show read-only countdown
-        if (inp)  inp.style.display  = "none";
-        if (cdEl) {
-          cdEl.style.display = "";
-          const fin = this._finishTimes[timerId];
-          if (fin) {
-            const rem = Math.max(0, Math.round((fin - now) / 1000));
-            cdEl.textContent = fmtSecs(rem);
-            cdEl.className   = "countdown running";
-          }
-        }
-        adjBtns.forEach(b => (b.style.display = "none"));
-      } else {
-        // idle or paused — show editable input + adj buttons; hide countdown span
-        if (inp)  inp.style.display  = "";
-        if (cdEl) cdEl.style.display = "none";
-        adjBtns.forEach(b => (b.style.display = ""));
-
-        // Write current value into the input (don't overwrite while user is focused)
-        if (inp && document.activeElement !== inp) {
-          let secs;
-          if (state === "paused") {
-            secs = this._pausedSecs[timerId] ?? durationToSecs(ts.attributes.remaining);
-          } else {
-            secs = this._inputSecs[timerId] ?? durationToSecs(ts.attributes.duration);
-          }
-          inp.value     = fmtSecs(secs);
-          inp.className = `timer-input ${state}`; // adds .paused styling when needed
-        }
-      }
-
-      // Show/hide correct action button set
-      if (timerBtns) {
-        timerBtns.querySelectorAll("[data-btn-state]").forEach(el => {
-          const visible = el.dataset.btnState.split(",").includes(state);
-          el.style.display = visible ? "" : "none";
-        });
-      }
-    });
-
-    // Update last-changed relative times
-    if (this._showLastChanged && this._hass) {
-      this.shadowRoot.querySelectorAll("[data-lc-bool]").forEach(el => {
-        const s = this._hass.states[el.dataset.lcBool];
-        if (s) el.textContent = fmtRelTime(s.last_changed);
-      });
-      this.shadowRoot.querySelectorAll("[data-lc-timer]").forEach(el => {
-        const s = this._hass.states[el.dataset.lcTimer];
-        if (s) el.textContent = fmtRelTime(s.last_changed);
-      });
-    }
+  _incrementSecs() {
+    const v = Number(this._c('increment_step')) || 1;
+    const unit = this._c('increment_unit');
+    return unit === 'hours' ? v * 3600 : unit === 'seconds' ? v : v * 60;
   }
 
-  // ── State updates (booleans) ─────────────────────────────────────────────
+  _allRows() { return this._sections.flatMap((s) => s.rows); }
 
-  _updateStates() {
-    if (!this._hass || !this._rows) return;
-    this._rows.forEach(s => s.rows.forEach(row => {
-      if (!row.bool) return;
-      const bs  = this._hass.states[row.bool];
-      const tog = this.shadowRoot.querySelector(`[data-bool="${row.bool}"]`);
-      if (tog && bs) {
-        const on = bs.state === "on";
-        tog.checked = on;
-        tog.closest(".row")?.classList.toggle("active", on);
-      }
-    }));
+  _allTimers() { return this._allRows().map((r) => r.timer).filter(Boolean); }
+
+  /** What, if it changes, needs the rows rebuilt (not just patched): which entities exist and their order. */
+  _signature() {
+    return this._sections.map((s) => `${s.section}:${s.rows.map((r) => `${r.bool || ''}|${r.timer || ''}`).join(',')}`).join(';');
   }
 
-  // ── Service calls ────────────────────────────────────────────────────────
-
-  _toggleBool(entityId, currentState) {
-    this._hass.callService("input_boolean",
-      currentState === "on" ? "turn_off" : "turn_on",
-      { entity_id: entityId });
-  }
-
-  _timerStart(timerId) {
-    const ts   = this._hass && this._hass.states[timerId];
-    const secs = this._inputSecs[timerId]
-      ?? (ts ? durationToSecs(ts.attributes.duration) : 0);
-    const data = { entity_id: timerId };
-    if (secs && secs > 0) data.duration = secsToHMS(secs);
-    this._hass.callService("timer", "start", data);
-    // Optimistic: show as active immediately
-    this._optimisticTimerState(timerId, "active", secs || durationToSecs(ts?.attributes?.duration));
-  }
-
-  _timerPause(timerId) {
-    // Optimistic: snapshot remaining time from the finish time we're tracking
-    const remSecs = this._finishTimes[timerId]
-      ? Math.max(0, Math.round((this._finishTimes[timerId] - Date.now()) / 1000))
-      : 0;
-    this._hass.callService("timer", "pause", { entity_id: timerId });
-    this._optimisticTimerState(timerId, "paused", remSecs);
-  }
-
-  _timerCancel(timerId) {
-    this._hass.callService("timer", "cancel", { entity_id: timerId });
-    delete this._inputSecs[timerId];
-    this._optimisticTimerState(timerId, "idle");
-  }
-
-  _timerFinish(timerId) {
-    this._hass.callService("timer", "finish", { entity_id: timerId });
-    delete this._inputSecs[timerId];
-    this._optimisticTimerState(timerId, "idle");
-  }
-
-  _timerAdjust(timerId, delta) {
-    const ts    = this._hass && this._hass.states[timerId];
-    const state = ts ? ts.state : "idle";
-    const step  = this._incrementSecs();
-
-    if (state === "active") {
-      const fin    = this._finishTimes[timerId] || Date.now();
-      const newFin = Math.max(Date.now() + 1000, fin + delta * step * 1000);
-      const remSecs = Math.round((newFin - Date.now()) / 1000);
-      this._finishTimes[timerId] = newFin;
-      // Restart with new duration so HA is in sync; also optimistic-update
-      this._hass.callService("timer", "start", { entity_id: timerId, duration: secsToHMS(remSecs) });
-      this._optimisticTimerState(timerId, "active", remSecs);
-    } else if (state === "paused") {
-      const cur = this._pausedSecs[timerId] ?? durationToSecs(ts.attributes.remaining);
-      const next = Math.max(step, cur + delta * step);
-      this._pausedSecs[timerId] = next;
-      this._tick();
-    } else {
-      // idle — adjust the pending input value
-      const cur = this._inputSecs[timerId] ?? durationToSecs(ts?.attributes?.duration ?? "0:05:00");
-      this._inputSecs[timerId] = Math.max(step, cur + delta * step);
-      const inp = this.shadowRoot.querySelector(`[data-input="${timerId}"]`);
-      if (inp) inp.value = fmtSecs(this._inputSecs[timerId]);
-    }
-  }
-
-  // ── Row HTML ─────────────────────────────────────────────────────────────
-
-  _rowHtml(row) {
-    const hasBool           = !!row.bool;
-    const hasTimer          = !!row.timer;
-    const sl                = this._showBtnLabels;
-    const showBadge         = this._config?.show_timer_badge === true;
-    const showToggle        = this._showToggle;
-    const showTimerInput    = this._showTimerInput;
-    const showTimerControls = this._showTimerControls;
-    const showEntityNames   = this._showEntityNames;
-
-    const timerOnlyHtml = showBadge ? `<span class="solo-timer-badge">timer only</span>` : "";
-
-    // Determine which column is rightmost (carries the 16px right padding)
-    const lastCol =
-      showToggle        ? "toggle" :
-      showTimerInput    ? "input"  :
-      showTimerControls ? "btns"   : "name";
-
-    const col1 = showEntityNames
-      ? `<span class="col-name label${lastCol === "name" ? " col-last" : ""}">${row.label}</span>`
-      : "";
-
-    const col2 = showTimerControls ? `<span class="col-btns${lastCol === "btns" ? " col-last" : ""}">${hasTimer ? `<span class="timer-btns" data-timer-btns="${row.timer}">
-          <button class="btn btn-start"  data-btn-state="idle,paused"   data-start="${row.timer}"  title="Start">▶${sl ? " Start" : ""}</button>
-          <button class="btn btn-pause"  data-btn-state="active"        data-pause="${row.timer}"  title="Pause"  style="display:none">⏸${sl ? " Pause" : ""}</button>
-          <button class="btn btn-cancel" data-btn-state="active,paused" data-cancel="${row.timer}" title="Cancel" style="display:none">✕${sl ? " Cancel" : ""}</button>
-          <button class="btn btn-finish" data-btn-state="active,paused" data-finish="${row.timer}" title="Finish" style="display:none">✓${sl ? " Finish" : ""}</button>
-        </span>` : ""}</span>` : "";
-
-    const col3 = showTimerInput ? `<span class="col-input${lastCol === "input" ? " col-last" : ""}">${hasTimer ? `<span class="timer-input-wrap">
-          <button class="btn btn-adj" data-adj="${row.timer}" data-delta="-1">−</button>
-          <input class="timer-input idle" type="text" placeholder="5m" title="e.g. 30m, 1h, 2h30m" data-input="${row.timer}" />
-          <span class="countdown running" data-countdown="${row.timer}" style="display:none">—</span>
-          <button class="btn btn-adj" data-adj="${row.timer}" data-delta="1">+</button>
-        </span>` : ""}</span>` : "";
-
-    const col4 = showToggle ? `<span class="col-toggle col-last">${hasBool ? `<ha-switch data-bool="${row.bool}"></ha-switch>` : timerOnlyHtml}</span>` : "";
-
-    // Last-changed sub-row (always rendered, visibility controlled by CSS display)
-    const lcBoolId  = row.bool  ? `data-lc-bool="${row.bool}"`   : "";
-    const lcTimerId = row.timer ? `data-lc-timer="${row.timer}"` : "";
-    const lastChangedRow = `<div class="row-last-changed" ${row.bool ? `data-lc-row="${row.bool}"` : ""}>
-        ${row.bool  ? `<span>Switch: <span ${lcBoolId}>—</span></span>`  : ""}
-        ${row.timer ? `<span>Timer: <span ${lcTimerId}>—</span></span>` : ""}
-      </div>`;
-
-    return `
-      <div class="row${hasBool ? "" : " solo-timer"}" ${hasBool ? `data-row="${row.bool}"` : ""}>
-        ${col1}${col2}${col3}${col4}
-      </div>
-      ${lastChangedRow}`;
-  }
-
-  // ── Render ───────────────────────────────────────────────────────────────
-
+  // ── Render (full) ───────────────────────────────────────────────────────
   _render() {
-    const cfg             = this._config ?? {};
-    const title           = cfg.title           ?? "BYPASS & TIMER MANAGER";
-    const activeColor     = cfg.active_color    ?? "var(--primary-color)";
-    const fontTitle       = cfg.font_size_title ? `${cfg.font_size_title}px` : "13px";
-    const fontName        = cfg.font_size_name  ? `${cfg.font_size_name}px` : "14px";
-    const fontGroup       = cfg.font_size_group ? `${cfg.font_size_group}px` : "11px";
-    const fontTimer       = cfg.font_size_timer ? `${cfg.font_size_timer}px` : "13px";
-    const colorCardTitle  = cfg.color_card_title  ?? "var(--secondary-text-color)";
-    const colorGroupLabel = cfg.color_group_label ?? "var(--secondary-text-color)";
-    const colorDivider    = cfg.color_divider     ?? "var(--divider-color)";
-    const colorEntityOff  = cfg.color_entity_off  ?? "var(--primary-text-color)";
-    const secInfoText     = cfg.secondary_info_text ?? "";
-    const secInfoSize     = cfg.secondary_info_size ? `${cfg.secondary_info_size}px` : "11px";
-    const secInfoColor    = cfg.secondary_info_color ?? "var(--primary-color)";
-    const showLastChanged = cfg.show_last_changed === true; // default: false
-    const fontLastChanged = cfg.font_size_last_changed ? `${cfg.font_size_last_changed}px` : "11px";
-    const colorLastChanged = cfg.color_last_changed ?? "var(--secondary-text-color)";
-    // Sync instance flags (setConfig may have been called before _render)
-    this._showToggle        = cfg.show_toggle         !== false;
-    this._showTimerInput    = cfg.show_timer_input    !== false;
-    this._showTimerControls = cfg.show_timer_controls !== false;
-    this._showEntityNames   = cfg.show_entity_names   !== false;
-    this._showLastChanged   = cfg.show_last_changed   === true;
-    this._entityPrefix      = cfg.entity_prefix       ?? "bypass_";
-    // Rebuild rows in case prefix or filters changed
-    if (this._hass) {
-      this._discoveryMode  = cfg.discovery_mode  ?? "prefix";
-      this._discoveryLabel = cfg.discovery_label ?? "bypass";
-      this._rows = buildRows(this._hass.states, this._hass.entities, cfg.type_filters, cfg.custom_types, this._entityPrefix, this._discoveryMode, this._discoveryLabel, cfg.strip_words ?? ["bypass"], cfg.strip_group_word !== false);
-    }
-    const showGroupLabels  = cfg.show_group_labels  !== false; // default: true
-    const showDividers     = cfg.show_dividers      !== false; // default: true
-    // Grid: optional [name] [ctrl-btns (optional)], then optional [input] [toggle]
-    const gridCols = [
-      this._showEntityNames   ? "1fr"         : null,
-      this._showTimerControls ? "max-content" : null,
-      this._showTimerInput    ? "max-content" : null,
-      this._showToggle        ? "max-content" : null,
-    ].filter(Boolean).join(" ");
-
-    const sectionsHtml = this._rows.map((section, si) => `
-      ${si > 0 && showDividers ? '<div class="divider"></div>' : ""}
-      ${showGroupLabels ? `<div class="section-label">${section.section}</div>` : ""}
-      ${section.rows.map(row => this._rowHtml(row)).join("")}
-    `).join("");
-
-    this.shadowRoot.innerHTML = `
-<style>
-  :host { display: block; font-family: var(--primary-font-family, sans-serif); }
-  .card { background: var(--card-background-color); border-radius: var(--ha-card-border-radius, 12px); padding: 12px 0 8px; }
-  .card-title { font-size: ${fontTitle}; font-weight: 600; letter-spacing: .05em; color: ${colorCardTitle}; padding: 0 16px 4px; }
-  .card-secondary { font-size: ${secInfoSize}; font-weight: 500; letter-spacing: 0; text-transform: none; color: ${secInfoColor}; padding: 0 16px 8px; display: ${secInfoText ? "block" : "none"}; }
-  .section-label { font-size: ${fontGroup}; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; color: ${colorGroupLabel}; opacity: .7; padding: 10px 16px 4px; }
-
-  /* ── Grid layout ── */
-  .card { display: grid !important;
-          grid-template-columns: ${gridCols};
-          align-items: center;
-          column-gap: 12px; }
-  .card-title  { grid-column: 1 / -1; }
-  .card-secondary { grid-column: 1 / -1; }
-  .section-label, .divider { grid-column: 1 / -1; }
-
-  .row { display: contents; }
-  .row > span { padding: 5px 0; }
-  .row-last-changed { grid-column: 1 / -1; font-size: ${fontLastChanged}; color: ${colorLastChanged};
-                      padding: 0 16px 6px; display: ${showLastChanged ? "flex" : "none"};
-                      gap: 16px; flex-wrap: wrap; }
-
-  .row:hover > span { background: var(--secondary-background-color); }
-  .row.active .label { color: ${activeColor}; font-weight: 700; }
-  .row.solo-timer > span { opacity: .75; }
-
-  /* Column 1 — Name */
-  .col-name { padding-left: 16px !important; font-size: ${fontName}; color: var(--primary-text-color);
-              white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-weight: 400; }
-  .row:not(.active) .col-name { color: ${colorEntityOff}; }
-
-  /* Countdown span */
-  .countdown { font-size: ${fontTimer}; font-family: var(--paper-font-code_-_font-family, monospace);
-               font-weight: 600; min-width: 80px; text-align: center; display: inline-block; }
-  .countdown.running { color: var(--primary-color); }
-
-  /* Column 2 — Control buttons (left-justified) */
-  .col-btns { display: flex; justify-content: flex-start; }
-  .timer-btns { display: inline-flex; gap: 6px; }
-
-  /* Column 3 — Input / countdown */
-  .col-input { }
-  .timer-input-wrap { display: inline-flex; align-items: center; gap: 4px; }
-  .timer-input { height: 26px; width: 80px; font-size: 12px; padding: 0 6px;
-                 border: 1px solid var(--divider-color); border-radius: 6px;
-                 background: var(--card-background-color); color: var(--primary-text-color);
-                 text-align: center; }
-  .timer-input:focus { outline: none; border-color: var(--primary-color); }
-  .timer-input.paused { border-color: var(--warning-color, #f4b942);
-                        color: var(--warning-color, #f4b942); }
-
-  /* Column 4 — Toggle */
-  .col-toggle { }
-  /* Always pad the rightmost visible column */
-  .col-last { padding-right: 16px !important; }
-  .btn { height: 26px; padding: 0 8px; font-size: 11px; font-weight: 500; border: none; border-radius: 6px; cursor: pointer; white-space: nowrap; transition: opacity .15s; line-height: 26px; }
-  .btn:active { opacity: .7; }
-  .btn-adj    { width: 26px; padding: 0; text-align: center; background: var(--secondary-background-color); color: var(--primary-text-color); font-size: 16px; line-height: 24px; }
-  .btn-start  { background: var(--primary-color); color: var(--text-primary-color, #fff); }
-  .btn-pause  { background: var(--warning-color, #f4b942); color: #000; }
-  .btn-cancel { background: var(--error-color, #db4437); color: #fff; }
-  .btn-finish { background: var(--success-color, #43a047); color: #fff; }
-
-  .solo-timer-badge { font-size: 10px; color: var(--disabled-text-color, var(--secondary-text-color)); font-style: italic; padding-right: 4px; padding-top: 6px; }
-  ha-switch { --mdc-theme-secondary: ${activeColor}; }
-  .divider { height: 1px; background: ${colorDivider}; margin: 4px 16px; opacity: .5; }
-</style>
-<ha-card class="card">
-  <div class="card-title">${title}</div>
-  <div class="card-secondary">${secInfoText}</div>
-  ${sectionsHtml}
-</ha-card>`;
-
-    // Boolean toggles
-    this.shadowRoot.querySelectorAll("ha-switch").forEach(sw => {
-      sw.addEventListener("change", () => {
-        const bs = this._hass?.states[sw.dataset.bool];
-        if (bs) this._toggleBool(sw.dataset.bool, bs.state);
-      });
-    });
-
-    // Timer action buttons
-    this.shadowRoot.querySelectorAll("[data-start]").forEach(btn =>
-      btn.addEventListener("click", () => this._timerStart(btn.dataset.start)));
-    this.shadowRoot.querySelectorAll("[data-pause]").forEach(btn =>
-      btn.addEventListener("click", () => this._timerPause(btn.dataset.pause)));
-    this.shadowRoot.querySelectorAll("[data-cancel]").forEach(btn =>
-      btn.addEventListener("click", () => this._timerCancel(btn.dataset.cancel)));
-    this.shadowRoot.querySelectorAll("[data-finish]").forEach(btn =>
-      btn.addEventListener("click", () => this._timerFinish(btn.dataset.finish)));
-
-    // +/- adjust buttons
-    this.shadowRoot.querySelectorAll("[data-adj]").forEach(btn =>
-      btn.addEventListener("click", () =>
-        this._timerAdjust(btn.dataset.adj, parseInt(btn.dataset.delta))));
-
-    // Manual input field — update _inputSecs on change
-    this.shadowRoot.querySelectorAll("[data-input]").forEach(inp => {
-      const update = () => {
-        const secs = parseInput(inp.value);
-        if (secs > 0) {
-          this._inputSecs[inp.dataset.input] = secs;
-          // _tick() will reflect the new value on the next cycle;
-          // for instant feedback, force a tick now only when idle
-          const ts = this._hass && this._hass.states[inp.dataset.input];
-          if (!ts || ts.state === "idle") this._tick();
-        }
-      };
-      inp.addEventListener("change", update);
-      inp.addEventListener("input",  update);
-    });
-
-    this._updateStates();
+    if (!this._hass) return;
+    const c = this._config;
+    this._sections = buildSections(this._hass, c);
+    this._sig = this._signature();
+    const cols = columns(c);
+    const title = this._c('title');
+    const sec = this._c('secondary_info_text');
+    const showGroups = this._c('show_group_labels') && this._c('group_rows');
+    const body = this._sections.length
+      ? this._sections.map((s, i) => `${i > 0 && this._c('show_dividers') && this._c('group_rows') ? '<div class="divider"></div>' : ''}${
+        showGroups && s.section ? `<div class="section-label">${esc(s.section)}</div>` : ''}${s.rows.map((r) => this._rowHtml(r, cols)).join('')}`).join('')
+      : '<div class="empty">No bypass switches or timers found.</div>';
+    this.shadowRoot.innerHTML = `<style>${CARD_CSS}</style>
+      <ha-card class="card" style="${esc(rootStyleVars(c, cols.map((x) => x[1]).join(' ') || '1fr'))}">
+        ${title || this._c('show_active_count') ? `<div class="head"><span class="card-title">${esc(title)}</span>${
+          this._c('show_active_count') ? '<span class="count" data-count></span>' : ''}</div>` : ''}
+        ${sec ? `<div class="card-secondary">${esc(sec)}</div>` : ''}
+        ${body}
+      </ha-card>`;
+    this._wire();
     this._syncTimerTimes();
+    this._patch();
     this._tick();
   }
 
-  disconnectedCallback() { if (this._interval) clearInterval(this._interval); }
-
-  getCardSize() {
-    return this._rows
-      ? this._rows.reduce((n, s) => n + s.rows.length, 0) + this._rows.length
-      : 12;
+  _rowHtml(row, cols) {
+    const c = this._config;
+    const sl = this._c('show_button_labels');
+    const t = row.timer;
+    const cell = {
+      icon: () => `<span class="col-icon"><button class="icon-btn" data-icon-tap="${esc(row.bool || row.timer)}" title="${row.bool ? 'Turn on / off' : 'Details'}"><ha-icon icon="${esc(row.icon)}"></ha-icon></button></span>`,
+      name: () => `<span class="col-name" data-more="${esc(row.bool || row.timer)}" title="${esc(row.bool || row.timer)}">${esc(row.label)}</span>`,
+      btns: () => `<span class="col-btns">${t ? `<span class="timer-btns" data-timer-btns="${esc(t)}">${[
+        ['show_btn_start', 'start', 'idle,paused', '▶', 'Start'],
+        ['show_btn_pause', 'pause', 'active', '⏸', 'Pause'],
+        ['show_btn_stop', 'stop', 'active,paused', '■', 'Stop'],
+        ['show_btn_finish', 'finish', 'active,paused', '✓', 'Finish'],
+      ].filter(([k]) => cfg(c, k)).map(([, act, states, glyph, name]) => `<button class="btn btn-${act}" data-act="${act}" data-timer="${esc(t)}" data-btn-state="${states}" title="${name}"${
+        states.includes('idle') ? '' : ' style="display:none"'}>${glyph}${sl ? ` ${name}` : ''}</button>`).join('')}</span>` : ''}</span>`,
+      time: () => `<span class="col-time">${t ? `<span class="timer-input-wrap">${this._c('show_timer_input') ? `
+        <button class="btn btn-adj" data-adj="${esc(t)}" data-delta="-1" title="Less">−</button>
+        <input class="timer-input idle" type="text" placeholder="5m" title="e.g. 30m, 1h, 2h30m" data-input="${esc(t)}">` : ''}${
+        this._c('show_countdown') ? `<span class="countdown" data-countdown="${esc(t)}" style="display:none">—</span>` : ''}${this._c('show_timer_input') ? `
+        <button class="btn btn-adj" data-adj="${esc(t)}" data-delta="1" title="More">+</button>` : ''}</span>` : ''}</span>`,
+      dur: () => `<span class="col-dur"${t ? ` data-dur="${esc(t)}" data-more="${esc(t)}" title="Timer duration"` : ''}></span>`,
+      toggle: () => `<span class="col-toggle">${row.bool ? `<ha-switch data-bool="${esc(row.bool)}"></ha-switch>`
+        : (this._c('show_timer_badge') ? '<span class="solo-timer-badge">timer only</span>' : '')}</span>`,
+    };
+    const html = cols.map(([k], i) => {
+      let h = cell[k]();
+      const extra = [i === 0 && 'col-first', i === cols.length - 1 && 'col-last'].filter(Boolean).join(' ');
+      if (extra) h = h.replace(/^<span class="([^"]+)"/, `<span class="$1 ${extra}"`);
+      return h;
+    }).join('');
+    const clock = this._c('show_exact_time');
+    const lc = this._c('show_last_changed') ? `<div class="row-last-changed">${
+      row.bool ? `<span>Switch: <span data-lc="${esc(row.bool)}">—</span>${clock ? ` <span class="lc-clock" data-lc-clock="${esc(row.bool)}"></span>` : ''}</span>` : ''}${
+      t ? `<span>Timer: <span data-lc="${esc(t)}">—</span>${clock ? ` <span class="lc-clock" data-lc-clock="${esc(t)}"></span>` : ''}</span>` : ''}</div>` : '';
+    return `<div class="row${row.bool ? '' : ' solo-timer'}" data-row="${esc(row.bool || row.timer)}">${html}</div>${lc}`;
   }
 
-  static getConfigElement() { return document.createElement("bypass-manager-card-editor"); }
-  static getStubConfig()    { return { title: "BYPASS & TIMER MANAGER", type_filters: ["Motion","Door","Window","Light","Other"] }; }
+  _wire() {
+    const root = this.shadowRoot;
+    root.querySelectorAll('ha-switch[data-bool]').forEach((sw) => sw.addEventListener('change', () => this._toggleBool(sw.dataset.bool)));
+    root.querySelectorAll('[data-icon-tap]').forEach((b) => b.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const id = b.dataset.iconTap;
+      if (id.startsWith('input_boolean.')) this._toggleBool(id); else this._moreInfo(id);
+    }));
+    root.querySelectorAll('[data-more]').forEach((el) => el.addEventListener('click', () => this._moreInfo(el.dataset.more)));
+    root.querySelectorAll('[data-act]').forEach((b) => b.addEventListener('click', () => {
+      const t = b.dataset.timer;
+      ({ start: () => this._timerStart(t), pause: () => this._timerPause(t), stop: () => this._timerStop(t), finish: () => this._timerFinish(t) })[b.dataset.act]();
+    }));
+    root.querySelectorAll('[data-adj]').forEach((b) => b.addEventListener('click', () => this._timerAdjust(b.dataset.adj, Number(b.dataset.delta))));
+    root.querySelectorAll('[data-input]').forEach((inp) => {
+      const update = () => {
+        const secs = parseInput(inp.value);
+        if (secs > 0) this._inputSecs[inp.dataset.input] = secs;
+      };
+      inp.addEventListener('change', () => { update(); this._tick(); });
+      inp.addEventListener('input', update);
+    });
+  }
+
+  // ── Live updates ────────────────────────────────────────────────────────
+  _update() {
+    if (!this._hass) return;
+    const next = buildSections(this._hass, this._config);
+    const sig = next.map((s) => `${s.section}:${s.rows.map((r) => `${r.bool || ''}|${r.timer || ''}`).join(',')}`).join(';');
+    // A bypass appeared / disappeared, or the active-first order changed: rebuild the rows.
+    // Never while a time is being typed — the next update catches up.
+    if (sig !== this._sig && !this.shadowRoot.activeElement) { this._render(); return; }
+    this._syncTimerTimes();
+    this._patch();
+  }
+
+  /** Patch everything state-driven in place: switches, on/off rows, durations, count, glow. */
+  _patch() {
+    const h = this._hass;
+    const root = this.shadowRoot;
+    let on = 0;
+    for (const row of this._allRows()) {
+      const isOn = rowIsOn(h, row);
+      if (isOn) on++;
+      const el = root.querySelector(`.row[data-row="${cssEsc(row.bool || row.timer)}"]`);
+      if (el) {
+        el.classList.toggle('active', isOn);
+        el.classList.toggle('timing', !!(row.timer && h.states[row.timer] && h.states[row.timer].state !== 'idle'));
+      }
+      if (row.bool) {
+        const sw = root.querySelector(`ha-switch[data-bool="${cssEsc(row.bool)}"]`);
+        if (sw) sw.checked = isOn;
+      }
+      if (row.timer) {
+        const d = root.querySelector(`[data-dur="${cssEsc(row.timer)}"]`);
+        const ts = h.states[row.timer];
+        if (d) d.textContent = ts ? fmtDuration(durationToSecs(ts.attributes && ts.attributes.duration)) : '—';
+      }
+    }
+    const count = root.querySelector('[data-count]');
+    if (count) {
+      count.textContent = on ? `${on} active` : 'All off';
+      count.classList.toggle('on', on > 0);
+    }
+    const card = root.querySelector('ha-card');
+    if (card) card.classList.toggle('glow', !!(this._c('glow_when_active') && on));
+  }
+
+  _syncTimerTimes() {
+    if (!this._hass) return;
+    for (const t of this._allTimers()) {
+      const ts = this._hass.states[t];
+      if (!ts) continue;
+      if (ts.state === 'active' && ts.attributes.finishes_at) {
+        this._finishTimes[t] = new Date(ts.attributes.finishes_at).getTime();
+        delete this._pausedSecs[t];
+      } else if (ts.state === 'paused') {
+        this._pausedSecs[t] = durationToSecs(ts.attributes.remaining);
+        delete this._finishTimes[t];
+      } else {
+        delete this._finishTimes[t];
+        delete this._pausedSecs[t];
+      }
+    }
+  }
+
+  _startTick() {
+    if (this._interval) clearInterval(this._interval);
+    this._interval = setInterval(() => this._tick(), 1000);
+  }
+
+  /** Once a second: countdowns, which buttons/fields show, last-changed times. */
+  _tick() {
+    if (!this._hass) return;
+    const root = this.shadowRoot;
+    const now = Date.now();
+    for (const t of this._allTimers()) {
+      const ts = this._hass.states[t];
+      if (!ts) continue;
+      const q = (sel) => root.querySelector(`[${sel}="${cssEsc(t)}"]`);
+      const inp = q('data-input');
+      const cd = q('data-countdown');
+      const adj = root.querySelectorAll(`[data-adj="${cssEsc(t)}"]`);
+      const state = ts.state;
+      const remaining = state === 'active'
+        ? Math.max(0, Math.round(((this._finishTimes[t] || now) - now) / 1000))
+        : state === 'paused' ? (this._pausedSecs[t] ?? durationToSecs(ts.attributes.remaining)) : null;
+      // Running: read-only countdown. Idle / paused: the editable time (if shown), else the countdown while paused.
+      const showInput = !!inp && state !== 'active';
+      if (inp) inp.style.display = showInput ? '' : 'none';
+      adj.forEach((b) => { b.style.display = showInput ? '' : 'none'; });
+      if (cd) {
+        const showCd = state === 'active' || (state === 'paused' && !inp);
+        cd.style.display = showCd ? '' : 'none';
+        if (showCd) { cd.textContent = fmtSecs(remaining); cd.classList.toggle('paused', state === 'paused'); }
+      }
+      if (showInput && root.activeElement !== inp) {
+        const secs = state === 'paused' ? remaining : (this._inputSecs[t] ?? durationToSecs(ts.attributes.duration));
+        inp.value = fmtSecs(secs);
+        inp.className = `timer-input ${state}`;
+      }
+      const btns = q('data-timer-btns');
+      if (btns) btns.querySelectorAll('[data-btn-state]').forEach((b) => { b.style.display = b.dataset.btnState.split(',').includes(state) ? '' : 'none'; });
+    }
+    root.querySelectorAll('[data-lc]').forEach((el) => {
+      const s = this._hass.states[el.dataset.lc];
+      if (s) el.textContent = fmtRelTime(s.last_changed, now);
+    });
+    root.querySelectorAll('[data-lc-clock]').forEach((el) => {
+      const s = this._hass.states[el.dataset.lcClock];
+      const clock = s ? fmtClock(s.last_changed, now) : '';
+      el.textContent = clock ? `· ${clock}` : '';
+    });
+  }
+
+  // ── Actions ─────────────────────────────────────────────────────────────
+  _moreInfo(entityId) {
+    this.dispatchEvent(new CustomEvent('hass-more-info', { detail: { entityId }, bubbles: true, composed: true }));
+  }
+
+  _toggleBool(entityId) {
+    const s = this._hass && this._hass.states[entityId];
+    if (!s) return;
+    this._hass.callService('input_boolean', s.state === 'on' ? 'turn_off' : 'turn_on', { entity_id: entityId });
+  }
+
+  /** Mirror a timer change locally so the row reacts before Home Assistant reports back. */
+  _optimistic(t, state, remSecs) {
+    if (state === 'active') { this._finishTimes[t] = Date.now() + (remSecs || 0) * 1000; delete this._pausedSecs[t]; }
+    else if (state === 'paused') { this._pausedSecs[t] = remSecs || 0; delete this._finishTimes[t]; }
+    else { delete this._finishTimes[t]; delete this._pausedSecs[t]; }
+    if (this._hass && this._hass.states[t]) {
+      this._hass = { ...this._hass, states: { ...this._hass.states, [t]: { ...this._hass.states[t], state } } };
+    }
+    this._tick();
+  }
+
+  _timerStart(t) {
+    const ts = this._hass.states[t];
+    const state = ts ? ts.state : 'idle';
+    const data = { entity_id: t };
+    let secs;
+    if (state === 'paused') {
+      secs = this._pausedSecs[t] ?? durationToSecs(ts.attributes.remaining);
+      // A paused time changed with +/- restarts at the new length; otherwise resume.
+      if (secs !== durationToSecs(ts.attributes.remaining)) data.duration = secsToHMS(secs);
+    } else {
+      secs = this._inputSecs[t] ?? (ts ? durationToSecs(ts.attributes.duration) : 0);
+      if (secs > 0) data.duration = secsToHMS(secs);
+    }
+    this._hass.callService('timer', 'start', data);
+    this._optimistic(t, 'active', secs);
+  }
+
+  _timerPause(t) {
+    const rem = this._finishTimes[t] ? Math.max(0, Math.round((this._finishTimes[t] - Date.now()) / 1000)) : 0;
+    this._hass.callService('timer', 'pause', { entity_id: t });
+    this._optimistic(t, 'paused', rem);
+  }
+
+  _timerStop(t) {
+    this._hass.callService('timer', 'cancel', { entity_id: t });
+    delete this._inputSecs[t];
+    this._optimistic(t, 'idle');
+  }
+
+  _timerFinish(t) {
+    this._hass.callService('timer', 'finish', { entity_id: t });
+    delete this._inputSecs[t];
+    this._optimistic(t, 'idle');
+  }
+
+  _timerAdjust(t, delta) {
+    const ts = this._hass.states[t];
+    const state = ts ? ts.state : 'idle';
+    const step = this._incrementSecs();
+    if (state === 'active') {
+      const fin = Math.max(Date.now() + 1000, (this._finishTimes[t] || Date.now()) + delta * step * 1000);
+      const rem = Math.round((fin - Date.now()) / 1000);
+      this._hass.callService('timer', 'start', { entity_id: t, duration: secsToHMS(rem) });
+      this._optimistic(t, 'active', rem);
+    } else if (state === 'paused') {
+      const cur = this._pausedSecs[t] ?? durationToSecs(ts.attributes.remaining);
+      this._pausedSecs[t] = Math.max(step, cur + delta * step);
+      this._tick();
+    } else {
+      const cur = this._inputSecs[t] ?? durationToSecs((ts && ts.attributes.duration) || '0:05:00');
+      this._inputSecs[t] = Math.max(step, cur + delta * step);
+      this._tick();
+    }
+  }
 }
 
-customElements.define("bypass-manager-card", BypassManagerCard);
+// ---------------------------------------------------------------------------
+// Editor
+// ---------------------------------------------------------------------------
+const THEME_COLORS = [
+  ['var(--primary-color)', 'Primary'],
+  ['var(--accent-color)', 'Accent'],
+  ['var(--primary-text-color)', 'Primary text'],
+  ['var(--secondary-text-color)', 'Secondary text'],
+  ['var(--disabled-text-color)', 'Disabled text'],
+  ['var(--state-active-color)', 'State active'],
+  ['var(--error-color)', 'Error'],
+  ['var(--warning-color)', 'Warning'],
+  ['var(--success-color)', 'Success'],
+  ['var(--info-color)', 'Info'],
+];
 
-// ---------------------------------------------------------------------------
-// Visual Editor
-// ---------------------------------------------------------------------------
+function colorMode(cur) {
+  cur = cur == null ? '' : String(cur);
+  if (cur === '') return 'default';
+  if (/^#[0-9a-fA-F]{3,8}$/.test(cur)) return 'custom';
+  if (/^var\(/.test(cur) && THEME_COLORS.some(([v]) => v === cur)) return 'theme';
+  return 'css';
+}
+
+const EDITOR_CSS = `
+        .bmce {
+          /* Font sizes (by role, not by pixel) */
+          --ltek-fs-panel-title: 16px;  /* top-level panel / section title */
+          --ltek-fs-header: 15px;       /* editor header, panel summary */
+          --ltek-fs-group: 14px;        /* group heading inside a panel */
+          --ltek-fs-label: 13px;        /* standard field label / row */
+          --ltek-fs-body: 12px;         /* body text, most controls */
+          --ltek-fs-small: 11px;        /* hints, secondary text */
+          --ltek-fs-tiny: 10px;         /* badges, micro-labels */
+          /* Font weights */
+          --ltek-fw-normal: 400;        /* control labels (recede) */
+          --ltek-fw-medium: 500;
+          --ltek-fw-semibold: 600;
+          --ltek-fw-bold: 700;          /* titles, values (lead) */
+          /* Text colors */
+          --ltek-c-text: var(--primary-text-color, #e1e1e1);  /* primary */
+          --ltek-c-label: #ccc;         /* control labels */
+          --ltek-c-muted: #888;         /* hints / disabled */
+          --ltek-c-accent: var(--primary-color, #2196F3);
+          /* Accent tints — hover / active fills (kept as rgba literals; one place
+             to change). Default to the Material blue the cards shipped with. */
+          --ltek-c-accent-fade: rgba(var(--rgb-primary-color,33,150,243),0.12);       /* active / pressed fill */
+          --ltek-c-accent-fade-soft: rgba(var(--rgb-primary-color,33,150,243),0.08);  /* hover fill */
+          --ltek-c-error-fade: rgba(244,67,54,0.15);         /* delete hover fill */
+          /* Status colors — defer to the user's theme, fall back to Material. */
+          --ltek-c-error: var(--error-color, #f44336);
+          --ltek-c-success: var(--success-color, #4caf50);
+          --ltek-c-warning: var(--warning-color, #ffb300);
+          --ltek-c-info: var(--info-color, #2196F3);
+          /* Second accent: the green "library / shared" grouping (distinct from
+             the blue layout accent on purpose — NOT tied to --primary-color). */
+          --ltek-c-accent-lib: #7fd18a;
+          --ltek-c-on-accent: #fff;   /* text/icon on a solid accent fill */
+          /* Action icons (edit/copy/hide/etc): neutral idle → brighten on hover.
+             Delete stays a status color (error) on its own hover. */
+          --ltek-c-icon: #aaa;        /* idle action icon */
+          --ltek-c-icon-hover: #fff;  /* hovered action icon */
+          /* Surfaces */
+          --ltek-c-surface: rgba(255,255,255,0.015);        /* panels */
+          --ltek-c-surface-raised: rgba(255,255,255,0.02);  /* cards / rows */
+          /* Borders */
+          --ltek-c-panel-border: #3a3a3a;   /* panels */
+          --ltek-c-border: #444;            /* controls */
+          --ltek-c-border-soft: #333;       /* subtle inner dividers */
+          /* Radii */
+          --ltek-r-panel: 12px;   /* panels */
+          --ltek-r-card: 10px;    /* section cards */
+          --ltek-r-md: 8px;       /* blocks */
+          --ltek-r-ctrl: 6px;     /* inputs, selects, buttons */
+          /* Spacing scale (4px base) */
+          --ltek-sp-1: 4px;
+          --ltek-sp-2: 6px;
+          --ltek-sp-3: 8px;
+          --ltek-sp-4: 10px;
+          --ltek-sp-5: 12px;
+          --ltek-sp-6: 16px;
+          /* Control padding — uniform input/select/button height. */
+          --ltek-ctrl-pad: 6px 10px;
+          /* Icon sizes (two clear roles; one-off glyphs stay literal). */
+          --ltek-icon-sm: 16px;   /* inline / action icons */
+          --ltek-icon-lg: 20px;   /* panel-title icons */
+          /* Slider row geometry (shared by every slider) */
+          --ltek-slider-val-w: 44px;   /* value readout column width */
+          display: flex; flex-direction: column; gap: 8px; font-family: var(--paper-font-body1_-_font-family, sans-serif);
+        }
+        .bmce ha-icon { --mdc-icon-size: 18px; vertical-align: middle; }
+        .bmce-sec { border: 1px solid var(--ltek-c-panel-border); border-radius: var(--ltek-r-panel); background: var(--ltek-c-surface); overflow: hidden; }
+        .bmce-sec[open] { border-color: var(--ltek-c-accent); }
+        .bmce-sec > summary { display: flex; align-items: center; gap: var(--ltek-sp-3); padding: 14px 16px; cursor: pointer; user-select: none;
+          list-style: none; font-size: var(--ltek-fs-panel-title); font-weight: var(--ltek-fw-bold); color: var(--ltek-c-text); }
+        .bmce-sec > summary::-webkit-details-marker, .bmce-sub > summary::-webkit-details-marker { display: none; }
+        .bmce-sec > summary > ha-icon:not(.chev) { color: var(--ltek-c-accent); --mdc-icon-size: var(--ltek-icon-lg); }
+        .bmce-sec > summary .chev, .bmce-sub > summary .chev { margin-left: auto; color: #999; --mdc-icon-size: 20px; transition: transform .2s ease; transform: rotate(-90deg); }
+        .bmce-sec[open] > summary .chev, .bmce-sub[open] > summary .chev { transform: none; }
+        .bmce-body { padding: 0 16px 16px; }
+        .bmce-hint { color: var(--ltek-c-muted); font-size: var(--ltek-fs-small); margin: 0 0 var(--ltek-sp-3); }
+        .bmce-hint code { font-size: var(--ltek-fs-tiny); }
+        .bmce-group { color: var(--accent-color, var(--ltek-c-accent)); font-size: var(--ltek-fs-group); font-weight: var(--ltek-fw-semibold);
+          margin-top: var(--ltek-sp-4); padding-top: var(--ltek-sp-3); border-top: 1px solid var(--ltek-c-border-soft); }
+        .bmce-group.first { margin-top: 0; padding-top: 0; border-top: none; }
+        .bmce-sub { border-top: 1px solid var(--ltek-c-border-soft); border-radius: var(--ltek-r-ctrl); }
+        .bmce-sub[open] { border: 1px solid var(--accent-color, var(--ltek-c-accent)); margin: var(--ltek-sp-1) 0; }
+        .bmce-sub > summary { display: flex; align-items: center; gap: var(--ltek-sp-2); padding: var(--ltek-sp-3) var(--ltek-sp-2); cursor: pointer;
+          list-style: none; color: var(--ltek-c-accent); font-size: var(--ltek-fs-label); font-weight: var(--ltek-fw-semibold);
+          text-transform: uppercase; letter-spacing: 0.04em; }
+        .bmce-sub-body { padding: 0 var(--ltek-sp-4) var(--ltek-sp-4); }
+        .bmce-row { display: flex; align-items: center; gap: var(--ltek-sp-4); padding: var(--ltek-sp-1) 0; flex-wrap: wrap; justify-content: flex-start; }
+        .bmce-row label.lbl { color: var(--ltek-c-label); font-size: var(--ltek-fs-body); font-weight: var(--ltek-fw-normal); flex: none; }
+        .bmce-row input[type="text"], .bmce-row select { flex: 1 1 auto; min-width: 0; padding: var(--ltek-ctrl-pad);
+          background: var(--secondary-background-color, #2a2a2a); border: 1px solid var(--ltek-c-border); border-radius: var(--ltek-r-ctrl);
+          color: var(--ltek-c-text); font-size: var(--ltek-fs-body); }
+        .bmce-row input[type="range"] { flex: 1 1 auto; min-width: 100px; accent-color: var(--ltek-c-accent); cursor: pointer; }
+        .bmce-val { flex: 0 0 var(--ltek-slider-val-w); text-align: right; font-weight: var(--ltek-fw-bold); font-variant-numeric: tabular-nums;
+          white-space: nowrap; color: var(--ltek-c-text); font-size: var(--ltek-fs-body); }
+        .bmce-nowrap { flex-wrap: nowrap; }
+        .bmce-check { display: flex; align-items: center; gap: var(--ltek-sp-2); padding: var(--ltek-sp-1) 0; color: var(--ltek-c-label);
+          font-size: var(--ltek-fs-body); cursor: pointer; }
+        .bmce-check input { accent-color: var(--ltek-c-accent); }
+        .bmce-check .muted { color: var(--ltek-c-muted); font-size: var(--ltek-fs-small); }
+        .bmce-checks { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 0 var(--ltek-sp-4); }
+        .bmce-color { display: flex; flex: 1 1 auto; gap: var(--ltek-sp-2); flex-wrap: wrap; min-width: 0; }
+        .bmce-color select.bmce-cmode { flex: 0 0 auto; min-width: 120px; }
+        .bmce-color input[type="color"] { flex: 0 0 auto; width: 44px; height: 30px; padding: 0; border: none; background: none; cursor: pointer; }
+        .bmce-reset { border: none; background: none; padding: 0; color: var(--ltek-c-icon); cursor: pointer; }
+        .bmce-reset:hover { color: var(--ltek-c-icon-hover); }
+        .bmce-reset ha-icon { --mdc-icon-size: var(--ltek-icon-sm); }
+        .bmce-list { display: flex; flex-direction: column; gap: var(--ltek-sp-2); }
+        .bmce-item { display: flex; align-items: center; gap: var(--ltek-sp-2); padding: var(--ltek-sp-2) var(--ltek-sp-3);
+          background: var(--ltek-c-surface-raised); border-radius: var(--ltek-r-card); }
+        .bmce-item input[type="text"] { flex: 1 1 0; min-width: 0; padding: var(--ltek-ctrl-pad); background: var(--secondary-background-color, #2a2a2a);
+          border: 1px solid var(--ltek-c-border); border-radius: var(--ltek-r-ctrl); color: var(--ltek-c-text); font-size: var(--ltek-fs-body); }
+        .bmce-item > ha-icon { color: var(--ltek-c-accent); --mdc-icon-size: var(--ltek-icon-lg); flex: none; }
+        .bmce-del { border: none; background: none; padding: 0; cursor: pointer; color: var(--ltek-c-icon); flex: none; line-height: 0; }
+        .bmce-del ha-icon { --mdc-icon-size: var(--ltek-icon-sm); }
+        .bmce-del:hover { color: var(--ltek-c-error); }
+        .bmce-add { align-self: flex-start; padding: var(--ltek-ctrl-pad); border: 1px dashed var(--ltek-c-accent); border-radius: var(--ltek-r-ctrl);
+          background: transparent; color: var(--ltek-c-accent); font-size: var(--ltek-fs-body); font-weight: var(--ltek-fw-semibold); cursor: pointer; }
+        .bmce-add:hover { background: var(--ltek-c-accent-fade-soft); }
+        .bmce-foot { color: var(--ltek-c-muted); font-size: var(--ltek-fs-tiny); text-align: right; }
+`;
+
+// Settings that show or hide other settings: changing one re-renders the editor.
+const REVEAL_KEYS = new Set(['discovery_mode', 'group_rows', 'show_group_labels', 'show_dividers', 'show_icon', 'show_entity_names',
+  'show_toggle', 'show_timer_input', 'show_countdown', 'show_last_changed', 'show_active_count', 'secondary_info_text',
+  ...BTN_KEYS]);
 
 class BypassManagerCardEditor extends HTMLElement {
   constructor() {
     super();
     this._config = {};
-    this.attachShadow({ mode: "open" });
+    this._open = new Set(['discovery']);
+    this._rendered = false;
+    this._cmode = {}; // color key → mode chosen this session (keeps an empty Custom CSS field visible)
   }
 
   setConfig(config) {
-    this._config = { ...config };
-    this._render();
-  }
-
-  // Fire the HA config-changed event so the editor saves the new value
-  _fire(config) {
-    this.dispatchEvent(new CustomEvent("config-changed", {
-      detail: { config },
-      bubbles: true,
-      composed: true,
-    }));
-  }
-
-  _set(key, value) {
-    const next = { ...this._config, [key]: value };
-    // Remove keys that match defaults to keep YAML tidy
-    if (key === "title"              && value === "BYPASS & TIMER MANAGER")           delete next.title;
-    if (key === "entity_prefix"      && (!value || value === "bypass_"))              delete next.entity_prefix;
-    if (key === "discovery_mode"     && value === "prefix")                           delete next.discovery_mode;
-    if (key === "discovery_label"    && (!value || value === "bypass"))               delete next.discovery_label;
-    if (key === "show_button_labels" && value === false)                              delete next.show_button_labels;
-    if (key === "active_color"       && (!value || value === ""))                     delete next.active_color;
-    if (key === "color_card_title"   && (!value || value === ""))                     delete next.color_card_title;
-    if (key === "color_group_label"  && (!value || value === ""))                     delete next.color_group_label;
-    if (key === "color_divider"      && (!value || value === ""))                     delete next.color_divider;
-    if (key === "color_entity_off"   && (!value || value === ""))                     delete next.color_entity_off;
-    if (key === "secondary_info_text"  && (!value || value === ""))                  delete next.secondary_info_text;
-    if (key === "secondary_info_size"  && (!value || value === 11))                  delete next.secondary_info_size;
-    if (key === "secondary_info_color" && (!value || value === ""))                  delete next.secondary_info_color;
-    if (key === "show_last_changed"    && value === false)                            delete next.show_last_changed;
-    if (key === "font_size_last_changed" && (!value || value === 11))                delete next.font_size_last_changed;
-    if (key === "color_last_changed"   && (!value || value === ""))                  delete next.color_last_changed;
-    if (key === "font_size_name"     && (!value || value === 14))                     delete next.font_size_name;
-    if (key === "font_size_group"    && (!value || value === 11))                     delete next.font_size_group;
-    if (key === "font_size_timer"    && (!value || value === 13))                     delete next.font_size_timer;
-    if (key === "show_timer_badge"   && value === false)                              delete next.show_timer_badge;
-    if (key === "show_toggle"          && value === true)  delete next.show_toggle;
-    if (key === "show_timer_controls"  && value === true)  delete next.show_timer_controls;
-    if (key === "show_entity_names"    && value === true)  delete next.show_entity_names;
-    if (key === "font_size_title"      && (!value || value === 13)) delete next.font_size_title;
-    if (key === "show_timer_input"    && value === true)                               delete next.show_timer_input;
-    if (key === "show_group_labels"    && value === true)                               delete next.show_group_labels;
-    if (key === "show_dividers"        && value === true)                               delete next.show_dividers;
-    if (key === "custom_types"       && (!value || value.length === 0))               delete next.custom_types;
-    if (key === "increment_step"     && (value === 1 || value === "1"))               delete next.increment_step;
-    if (key === "increment_unit"     && value === "minutes")                          delete next.increment_unit;
-    if (key === "strip_words"       && (!value || (value.length === 1 && value[0] === "bypass"))) delete next.strip_words;
-    if (key === "strip_group_word"  && value === true)                                             delete next.strip_group_word;
+    const next = normalizeConfig(config);
+    const changed = JSON.stringify(next) !== JSON.stringify(this._config);
     this._config = next;
-    this._fire(next);
+    if (!this._rendered || changed) this._render();
+  }
+
+  set hass(hass) {
+    const first = !this._hass;
+    this._hass = hass;
+    if (first) this._render();
+  }
+
+  _emit() {
+    this._config = normalizeConfig(this._config);
+    this.dispatchEvent(new CustomEvent('config-changed', { detail: { config: this._config }, bubbles: true, composed: true }));
+  }
+
+  /** Write a value; empty or default removes the key (byte-stable YAML). */
+  _set(key, value) {
+    if (key === 'title' && value === '') { this._config.title = ''; this._emit(); return; } // empty title = no title line
+    if (value === '' || value === undefined || value === null || isDefault(key, value)) delete this._config[key];
+    else this._config[key] = value;
+    this._emit();
+  }
+
+  _c(key) { return cfg(this._config, key); }
+
+  _panel(id, icon, title, body) {
+    return `<details class="bmce-sec" data-panel="${id}"${this._open.has(id) ? ' open' : ''}>
+      <summary><ha-icon icon="${icon}"></ha-icon>${title}<ha-icon class="chev" icon="mdi:chevron-down"></ha-icon></summary>
+      <div class="bmce-body">${body}</div></details>`;
+  }
+
+  _sub(id, title, body) {
+    return `<details class="bmce-sub" data-panel="${id}"${this._open.has(id) ? ' open' : ''}>
+      <summary>${title}<ha-icon class="chev" icon="mdi:chevron-down"></ha-icon></summary>
+      <div class="bmce-sub-body">${body}</div></details>`;
+  }
+
+  _check(key, label, hint = '') {
+    return `<label class="bmce-check"><input type="checkbox" data-key="${key}"${this._c(key) ? ' checked' : ''}>${label}${
+      hint ? ` <span class="muted">${hint}</span>` : ''}</label>`;
+  }
+
+  _text(key, label, placeholder = '') {
+    const v = this._config[key] !== undefined ? this._config[key] : '';
+    return `<div class="bmce-row"><label class="lbl">${label}</label><input type="text" data-key="${key}" value="${esc(v)}" placeholder="${esc(placeholder)}"></div>`;
+  }
+
+  _select(key, label, options) {
+    const cur = this._c(key);
+    return `<div class="bmce-row"><label class="lbl">${label}</label><select data-key="${key}">${
+      options.map(([v, n]) => `<option value="${esc(v)}"${String(v) === String(cur) ? ' selected' : ''}>${esc(n)}</option>`).join('')}</select></div>`;
+  }
+
+  _slider(key, label, min, max, fmt = (n) => `${n}px`) {
+    const v = Number(this._c(key));
+    return `<div class="bmce-row bmce-nowrap"><label class="lbl">${label}</label>
+      <input type="range" data-skey="${key}" min="${min}" max="${max}" step="1" value="${v}">
+      <span class="bmce-val" data-val="${key}">${fmt(v)}</span>
+      ${this._config[key] !== undefined ? `<button class="bmce-reset" data-reset="${key}" title="Back to default"><ha-icon icon="mdi:restore"></ha-icon></button>` : ''}</div>`;
+  }
+
+  _colorControl(key) {
+    const [, label, defaultLabel, seedHex] = COLOR_DEFS.find((d) => d[0] === key);
+    const cur = this._config[key] || '';
+    const mode = this._cmode[key] || colorMode(cur);
+    let field = '';
+    if (mode === 'theme') {
+      field = `<select class="bmce-ctheme" data-ckey="${key}">${THEME_COLORS.map(([v, n]) => `<option value="${v}"${v === cur ? ' selected' : ''}>${n}</option>`).join('')}</select>`;
+    } else if (mode === 'custom') {
+      field = `<input type="color" class="bmce-chex" data-ckey="${key}" value="${/^#[0-9a-fA-F]{6}$/.test(cur) ? cur : seedHex}">`;
+    } else if (mode === 'css') {
+      field = `<input type="text" class="bmce-ccss" data-ckey="${key}" value="${esc(cur)}" placeholder="e.g. tomato, rgba(…), var(--my-color)">`;
+    }
+    const modes = [['default', defaultLabel], ['theme', 'Theme color'], ['custom', 'Custom color'], ['css', 'Custom CSS']];
+    return `<div class="bmce-row"><label class="lbl">${label}</label><div class="bmce-color">
+      <select class="bmce-cmode" data-ckey="${key}" data-seed="${seedHex}">${modes.map(([m, n]) => `<option value="${m}"${m === mode ? ' selected' : ''}>${n}</option>`).join('')}</select>
+      ${field}</div></div>`;
+  }
+
+  _discoveryBody() {
+    const c = this._config;
+    const label = this._c('discovery_mode') === 'label';
+    let found = '';
+    if (this._hass) {
+      const rows = discover(this._hass, c);
+      const sw = rows.filter((r) => r.bool).length;
+      const tm = rows.filter((r) => r.timer).length;
+      found = `<p class="bmce-hint">Found <b>${rows.length}</b> bypass${rows.length === 1 ? '' : 'es'}: ${sw} switch${sw === 1 ? '' : 'es'}, ${tm} timer${tm === 1 ? '' : 's'}.</p>`;
+    }
+    return `<p class="bmce-hint">The card finds every bypass on its own: security zones, doors, motion, lights, scenes, locks and anything else.
+        Each switch is paired with the timer of the same name.</p>
+      ${this._select('discovery_mode', 'Find by', [['prefix', 'Entity ID prefix'], ['label', 'Home Assistant label']])}
+      ${label
+    ? `${this._text('discovery_label', 'Label', 'bypass')}<p class="bmce-hint">Any <code>input_boolean</code> or <code>timer</code> with this label. "bypass" also matches labels that start with it.</p>`
+    : `${this._text('entity_prefix', 'Prefix', 'bypass_')}<p class="bmce-hint">Finds <code>input_boolean.&lt;prefix&gt;…</code> and <code>timer.&lt;prefix&gt;…</code>.</p>`}
+      ${found}`;
+  }
+
+  _groupsBody() {
+    const c = this._config;
+    const custom = c.custom_types || [];
+    const hidden = new Set(c.hidden_types || []);
+    const groups = allGroups(custom);
+    const rows = this._hass ? discover(this._hass, c) : [];
+    const counts = {};
+    rows.forEach((r) => { const g = groupFor(r.suffix, custom).label; counts[g] = (counts[g] || 0) + 1; });
+    return `<p class="bmce-hint">Each bypass lands in a group by the first type word in its name (motion, door, window, light, lock, scene, alarm, weather), or in Other.</p>
+      <div class="bmce-group first">Show groups</div>
+      <div class="bmce-checks">${groups.map((g) => `<label class="bmce-check"><input type="checkbox" data-group="${esc(g)}"${hidden.has(g) ? '' : ' checked'}>${esc(g)}${
+        this._hass ? ` <span class="muted">${counts[g] || 0}</span>` : ''}</label>`).join('')}</div>
+      <div class="bmce-group">Layout</div>
+      ${this._check('group_rows', 'Group rows by type', '(off: one list)')}
+      ${this._c('group_rows') ? `${this._check('show_group_labels', 'Show group titles')}${this._check('show_dividers', 'Show a line between groups')}` : ''}
+      ${this._select('sort', 'Order', [['name', 'By name'], ['active', 'Active first, newest change first']])}
+      <div class="bmce-group">Custom groups</div>
+      <p class="bmce-hint">A keyword found anywhere in a name puts it in your group. Custom groups are checked before the built-in ones.</p>
+      <div class="bmce-list">
+        <button class="bmce-add" data-ct-add>+ Group</button>
+        ${custom.map((ct, i) => `<div class="bmce-item">
+          <ha-icon icon="${esc(ct.icon || OTHER_ICON)}"></ha-icon>
+          <input type="text" data-ct="${i}" data-field="keyword" value="${esc(ct.keyword || '')}" placeholder="Keyword (fan)">
+          <input type="text" data-ct="${i}" data-field="label" value="${esc(ct.label || '')}" placeholder="Group name (Fans)">
+          <input type="text" data-ct="${i}" data-field="icon" value="${esc((ct.icon || '').replace(/^mdi:/, ''))}" placeholder="Icon (fan)">
+          <button class="bmce-del" data-ct-del="${i}" title="Remove"><ha-icon icon="mdi:trash-can-outline"></ha-icon></button></div>`).join('')}
+      </div>`;
+  }
+
+  _rowsBody() {
+    const anyBtn = BTN_KEYS.some((k) => this._c(k));
+    return `<p class="bmce-hint">What each row shows, left to right.</p>
+      <div class="bmce-group first">Switch & name</div>
+      ${this._check('show_icon', 'Bypass icon', '(tap to turn on / off)')}
+      ${this._check('show_entity_names', 'Name', '(tap for details)')}
+      ${this._check('show_toggle', 'On / off switch')}
+      ${this._c('show_toggle') ? this._check('show_timer_badge', '"timer only" on rows without a switch') : ''}
+      <div class="bmce-group">Timer</div>
+      ${this._check('show_timer_input', 'Set time', '(editable time + − / + buttons)')}
+      ${this._check('show_countdown', 'Countdown while running')}
+      ${this._check('show_duration', 'Duration', '(the timer\'s configured length)')}
+      <div class="bmce-checks">
+        ${this._check('show_btn_start', 'Start')}${this._check('show_btn_pause', 'Pause')}${this._check('show_btn_stop', 'Stop')}${this._check('show_btn_finish', 'Finish')}
+      </div>
+      ${anyBtn ? this._check('show_button_labels', 'Words on the buttons', '(▶ Start, not just ▶)') : ''}
+      ${this._c('show_timer_input') ? `${this._slider('increment_step', '− / + step', 1, 60, (n) => String(n))}
+      ${this._select('increment_unit', 'Step unit', [['seconds', 'Seconds'], ['minutes', 'Minutes'], ['hours', 'Hours']])}` : ''}
+      <div class="bmce-group">Last changed</div>
+      ${this._check('show_last_changed', 'Line under each row: when the switch and timer last changed')}
+      ${this._c('show_last_changed') ? this._check('show_exact_time', 'Also the clock time', '(2h 5m ago · 3:41 PM)') : ''}`;
+  }
+
+  _headerBody() {
+    return `<p class="bmce-hint">The title line. Clear the title to hide it.</p>
+      ${this._text('title', 'Title', DEFAULT_TITLE)}
+      ${this._text('secondary_info_text', 'Secondary text', 'Optional line under the title')}
+      <div class="bmce-group">Active bypasses</div>
+      ${this._check('show_active_count', 'Count on the title line', '("3 active" / "All off")')}
+      ${this._check('glow_when_active', 'Glow while any bypass is on')}`;
+  }
+
+  _namesBody() {
+    const words = this._config.strip_words || ['bypass'];
+    return `<p class="bmce-hint">Names come from the entity ID: <code>bypass_door_front</code> shows as "Front".</p>
+      ${this._check('strip_group_word', 'Remove the group word', '(door, motion, …)')}
+      <div class="bmce-group">Remove these words</div>
+      <div class="bmce-list">
+        <button class="bmce-add" data-sw-add>+ Word</button>
+        ${words.map((w, i) => `<div class="bmce-item"><input type="text" data-sw="${i}" value="${esc(w)}" placeholder="word">
+          <button class="bmce-del" data-sw-del="${i}" title="Remove"><ha-icon icon="mdi:trash-can-outline"></ha-icon></button></div>`).join('')}
+      </div>`;
+  }
+
+  _lookBody() {
+    const c = (k) => this._colorControl(k);
+    const s = (k) => { const d = SIZE_DEFS.find((x) => x[0] === k); return this._slider(k, d[1], d[2], d[3]); };
+    const subs = [
+      ['look-title', 'Title', [s('font_size_title'), c('color_card_title'),
+        ...(this._c('secondary_info_text') ? [s('secondary_info_size'), c('secondary_info_color')] : [])]],
+      ['look-names', 'Names & switch', [s('font_size_name'), c('active_color'), c('color_entity_off')]],
+      ...(this._c('show_icon') ? [['look-icons', 'Icons', [s('icon_size'), c('icon_color_on'), c('icon_color_off')]]] : []),
+      ...(this._c('group_rows') && (this._c('show_group_labels') || this._c('show_dividers')) ? [['look-groups', 'Groups', [
+        ...(this._c('show_group_labels') ? [s('font_size_group'), c('color_group_label')] : []),
+        ...(this._c('show_dividers') ? [c('color_divider')] : [])]]] : []),
+      ...(this._c('show_timer_input') || this._c('show_countdown') ? [['look-timer', 'Timer', [s('font_size_timer')]]] : []),
+      ...(this._c('show_last_changed') ? [['look-lc', 'Last changed', [s('font_size_last_changed'), c('color_last_changed')]]] : []),
+    ];
+    return `<p class="bmce-hint">Sizes and colors. Every color can follow your theme or be custom; ↺ puts a size back to its default.</p>
+      ${subs.map(([id, title, rows]) => this._sub(id, title, rows.join(''))).join('')}`;
   }
 
   _render() {
-    const cfg             = this._config;
-    const title           = cfg.title              ?? "BYPASS & TIMER MANAGER";
-    const entityPrefix    = cfg.entity_prefix      ?? "bypass_";
-    const discoveryMode   = cfg.discovery_mode     ?? "prefix";
-    const discoveryLabel  = cfg.discovery_label    ?? "bypass";
-    const showBtnLabels   = cfg.show_button_labels === true;
-    const showBadge       = cfg.show_timer_badge   === true;
-    const activeColor     = cfg.active_color       ?? "";
-    const colorCardTitle  = cfg.color_card_title   ?? "";
-    const colorGroupLabel = cfg.color_group_label  ?? "";
-    const colorDivider    = cfg.color_divider      ?? "";
-    const colorEntityOff  = cfg.color_entity_off   ?? "";
-    const secInfoText     = cfg.secondary_info_text  ?? "";
-    const secInfoSize     = cfg.secondary_info_size  ?? 11;
-    const secInfoColor    = cfg.secondary_info_color ?? "";
-    const showLastChanged = cfg.show_last_changed    === true;
-    const fontLastChanged = cfg.font_size_last_changed ?? 11;
-    const colorLastChanged = cfg.color_last_changed  ?? "";
-    const fontTitle       = cfg.font_size_title    ?? 13;
-    const fontName        = cfg.font_size_name     ?? 14;
-    const fontGroup       = cfg.font_size_group    ?? 11;
-    const fontTimer       = cfg.font_size_timer    ?? 13;
-    const incrementStep   = cfg.increment_step     ?? 1;
-    const incrementUnit   = cfg.increment_unit     ?? "minutes";
-    const showToggle        = cfg.show_toggle         !== false;
-    const showTimerInput    = cfg.show_timer_input    !== false;
-    const showTimerControls = cfg.show_timer_controls !== false;
-    const showEntityNames   = cfg.show_entity_names   !== false;
-    const showGroupLabels   = cfg.show_group_labels   !== false;
-    const showDividers      = cfg.show_dividers       !== false;
-    const typeFilters     = cfg.type_filters       ?? [...GROUP_ORDER];
-    const customTypes     = cfg.custom_types       ?? [];   // [{ keyword, label }]
-    const stripWords      = cfg.strip_words       ?? ["bypass"];
-    const stripGroupWord  = cfg.strip_group_word  !== false; // default: true
-
-    // All groups = built-ins + any custom labels
-    const allGroupsList = allGroups(customTypes);
-
-    // Filter chips — built-ins + custom labels
-    const filterBoxes = allGroupsList.map(g => `
-      <label class="chip ${typeFilters.includes(g) ? "chip-on" : ""}">
-        <input type="checkbox" class="filter-check" data-group="${g}" ${typeFilters.includes(g) ? "checked" : ""} />
-        ${g}
-      </label>`).join("");
-
-    // Custom type rows
-    const customRows = customTypes.map((ct, i) => `
-      <div class="ct-row" data-index="${i}">
-        <input class="text-input ct-keyword" type="text" placeholder="keyword (e.g. fan)"
-               value="${(ct.keyword || "").replace(/"/g, "&quot;")}" data-field="keyword" data-index="${i}">
-        <input class="text-input ct-label"   type="text" placeholder="group label (e.g. Fan)"
-               value="${(ct.label   || "").replace(/"/g, "&quot;")}" data-field="label"   data-index="${i}">
-        <button class="ct-remove" data-index="${i}" title="Remove">✕</button>
-      </div>`).join("");
-
-    this.shadowRoot.innerHTML = `
-<style>
-  :host { display: block; }
-  .editor { display: flex; flex-direction: column; gap: 16px; padding: 4px 0; }
-
-  .section-header {
-    font-size: 11px; font-weight: 700; text-transform: uppercase;
-    letter-spacing: .07em; color: var(--secondary-text-color);
-    border-bottom: 1px solid var(--divider-color);
-    padding-bottom: 6px; margin-bottom: 2px;
+    this.innerHTML = `<style>${EDITOR_CSS}</style>
+      <div class="bmce">
+        ${this._panel('discovery', 'mdi:magnify', 'Discovery', this._discoveryBody())}
+        ${this._panel('groups', 'mdi:shape-outline', 'Groups & order', this._groupsBody())}
+        ${this._panel('rows', 'mdi:view-list-outline', 'Rows & timer controls', this._rowsBody())}
+        ${this._panel('header', 'mdi:format-title', 'Title', this._headerBody())}
+        ${this._panel('names', 'mdi:format-letter-case', 'Names', this._namesBody())}
+        ${this._panel('look', 'mdi:palette', 'Appearance', this._lookBody())}
+        <div class="bmce-foot">Bypass &amp; Timer Manager Card ${BUILD_NUMBER}</div>
+      </div>`;
+    this._rendered = true;
+    this._wire();
   }
 
-  .field-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 36px; }
-  .field-row.col { flex-direction: column; align-items: stretch; gap: 6px; }
-
-  .field-label { font-size: 13px; color: var(--primary-text-color); flex: 1; line-height: 1.3; }
-  .field-hint  { font-size: 11px; color: var(--secondary-text-color); margin-top: 2px; display: block; }
-
-  .text-input, .num-input {
-    height: 34px; padding: 0 10px; font-size: 13px;
-    border: 1px solid var(--divider-color); border-radius: 8px;
-    background: var(--card-background-color); color: var(--primary-text-color);
-    box-sizing: border-box;
-  }
-  .text-input { width: 100%; }
-  .num-input  { width: 72px; text-align: center; }
-  .text-input:focus, .num-input:focus { outline: none; border-color: var(--primary-color); }
-
-  /* Color */
-  .color-row { display: flex; align-items: center; gap: 8px; }
-  .color-swatch { width: 34px; height: 34px; border-radius: 8px; border: 1px solid var(--divider-color);
-                  padding: 2px; cursor: pointer; background: var(--card-background-color); flex-shrink: 0; }
-  .color-swatch input[type=color] { width: 100%; height: 100%; border: none; background: none;
-                                     padding: 0; cursor: pointer; border-radius: 6px; }
-  .color-text { flex: 1; }
-  .color-clear { height: 34px; padding: 0 10px; font-size: 12px; border: 1px solid var(--divider-color);
-                 border-radius: 8px; background: transparent; color: var(--secondary-text-color);
-                 cursor: pointer; white-space: nowrap; }
-  .color-clear:hover { border-color: var(--primary-color); color: var(--primary-color); }
-
-  /* Font size */
-  .font-row { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 10px; }
-
-  /* Timer increment */
-  .increment-row { display: flex; align-items: center; gap: 8px; }
-  .unit-select { height: 34px; padding: 0 10px; font-size: 13px;
-                 border: 1px solid var(--divider-color); border-radius: 8px;
-                 background: var(--card-background-color); color: var(--primary-text-color);
-                 cursor: pointer; }
-  .unit-select:focus { outline: none; border-color: var(--primary-color); }
-
-  /* Segmented button group */
-  .seg-group { display: inline-flex; border: 1px solid var(--divider-color); border-radius: 8px; overflow: hidden; align-self: flex-start; }
-  .seg-btn { height: 34px; padding: 0 16px; font-size: 13px; font-weight: 500; border: none; border-right: 1px solid var(--divider-color);
-             background: var(--card-background-color); color: var(--secondary-text-color); cursor: pointer; transition: background .15s, color .15s; }
-  .seg-btn:last-child { border-right: none; }
-  .seg-btn:hover { background: var(--secondary-background-color); }
-  .seg-btn.seg-on { background: color-mix(in srgb, var(--primary-color) 15%, transparent); color: var(--primary-color); font-weight: 600; }
-
-  /* Filter chips */
-  .chips { display: flex; flex-wrap: wrap; gap: 8px; }
-  .chip { display: inline-flex; align-items: center; gap: 5px; padding: 4px 10px 4px 8px;
-          border-radius: 20px; font-size: 12px; cursor: pointer; border: 1px solid var(--divider-color);
-          color: var(--secondary-text-color); background: var(--card-background-color);
-          user-select: none; transition: all .15s; }
-  .chip input[type=checkbox] { accent-color: var(--primary-color); width: 13px; height: 13px; }
-  .chip-on { border-color: var(--primary-color); color: var(--primary-color);
-             background: color-mix(in srgb, var(--primary-color) 10%, transparent); }
-
-  /* Custom types list & strip-words list */
-  .ct-list, .sw-list { display: flex; flex-direction: column; gap: 8px; }
-  .sw-row { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 8px; }
-  .sw-row .text-input { font-size: 12px; height: 30px; }
-  .ct-row { display: grid; grid-template-columns: 1fr 1fr auto; align-items: center; gap: 8px; }
-  .ct-row .text-input { font-size: 12px; height: 30px; }
-  .ct-remove { height: 30px; width: 30px; border: 1px solid var(--divider-color); border-radius: 8px;
-               background: transparent; color: var(--error-color, #db4437); cursor: pointer;
-               font-size: 13px; display: flex; align-items: center; justify-content: center;
-               flex-shrink: 0; transition: background .15s; }
-  .ct-remove:hover { background: color-mix(in srgb, var(--error-color, #db4437) 12%, transparent); }
-  .ct-header { display: grid; grid-template-columns: 1fr 1fr auto; gap: 8px; }
-  .ct-header span { font-size: 10px; font-weight: 600; text-transform: uppercase;
-                    letter-spacing: .05em; color: var(--secondary-text-color); padding: 0 2px; }
-  .btn-add { height: 32px; padding: 0 14px; font-size: 12px; font-weight: 600;
-             border: 1px dashed var(--primary-color); border-radius: 8px;
-             background: transparent; color: var(--primary-color); cursor: pointer;
-             align-self: flex-start; transition: background .15s; }
-  .btn-add:hover { background: color-mix(in srgb, var(--primary-color) 10%, transparent); }
-
-  ha-switch { --mdc-theme-secondary: var(--primary-color); flex-shrink: 0; }
-
-  /* Grouped sub-fields shown beneath a toggle or heading */
-  .sub-fields { display: flex; flex-direction: column; gap: 10px;
-                border-left: 2px solid var(--divider-color); margin-left: 4px; padding-left: 12px; }
-
-  .info-box { background: var(--secondary-background-color); border-radius: 8px; padding: 10px 12px;
-              font-size: 12px; color: var(--secondary-text-color); line-height: 1.5; }
-  .info-box code { font-family: var(--paper-font-code_-_font-family, monospace);
-                   background: var(--divider-color); border-radius: 3px; padding: 1px 4px; font-size: 11px; }
-</style>
-
-<div class="editor">
-
-  <!-- ── How it works ── -->
-  <div class="section-header">About — v${VERSION}</div>
-  <div class="info-box">
-    This card <strong>auto-discovers</strong> entities — no manual list needed.<br>
-    In <strong>Prefix</strong> mode it pairs every <code>input_boolean.&lt;prefix&gt;*</code> with a matching <code>timer.&lt;prefix&gt;*</code>.<br>
-    In <strong>Label</strong> mode it finds any <code>input_boolean</code> or <code>timer</code> tagged with the chosen HA label, and pairs them by matching object ID.<br>
-    Rows are grouped by type (<em>Motion, Door, Window, Light, Other</em> + custom types).
-  </div>
-
-  <!-- ── Discovery ── -->
-  <div class="section-header">Discovery</div>
-
-  <div class="field-row col">
-    <label class="field-label">Discovery mode
-      <span class="field-hint">How the card finds bypass entities. <strong>Prefix</strong> matches entity IDs starting with the given prefix. <strong>Label</strong> finds any <code>input_boolean</code> or <code>timer</code> tagged with a specific HA label.</span>
-    </label>
-    <div class="seg-group" id="discovery_mode_group">
-      <button class="seg-btn ${discoveryMode === "prefix" ? "seg-on" : ""}" data-mode="prefix">Prefix</button>
-      <button class="seg-btn ${discoveryMode === "label"  ? "seg-on" : ""}" data-mode="label">Label</button>
-    </div>
-  </div>
-
-  <div class="field-row col" id="prefix_row" style="${discoveryMode === "label" ? "display:none" : ""}">
-    <label class="field-label">Entity prefix
-      <span class="field-hint">The card looks for <code>input_boolean.&lt;prefix&gt;*</code> and <code>timer.&lt;prefix&gt;*</code>. Default: <code>bypass_</code></span>
-    </label>
-    <input id="entity_prefix" class="text-input" type="text" placeholder="bypass_"
-           value="${entityPrefix.replace(/"/g, "&quot;")}">
-  </div>
-
-  <div class="field-row col" id="label_row" style="${discoveryMode !== "label" ? "display:none" : ""}">
-    <label class="field-label">HA label
-      <span class="field-hint">The card finds all <code>input_boolean</code> and <code>timer</code> entities that have this label assigned in Home Assistant. Default: <code>bypass</code>. Partial matches work — <code>bypass</code> matches <em>bypass_helper</em>, <em>bypass_timer</em>, etc.</span>
-    </label>
-    <input id="discovery_label" class="text-input" type="text" placeholder="bypass"
-           value="${discoveryLabel.replace(/"/g, "&quot;")}">
-  </div>
-
-  <!-- ── Entity Groups ── -->
-  <div class="section-header">Entity Groups</div>
-  <div class="field-row col">
-    <label class="field-label">Show only these entity types
-      <span class="field-hint">Uncheck a group to hide it entirely from the card. Custom types appear here automatically.</span>
-    </label>
-    <div class="chips" id="filter-chips">${filterBoxes}</div>
-  </div>
-
-  <div class="field-row col">
-    <label class="field-label">Custom entity groups
-      <span class="field-hint">Each entry maps a keyword (matched against the entity suffix) to a group label. Custom types are checked before built-ins.</span>
-    </label>
-    <div class="ct-list" id="ct-list">
-      ${customTypes.length > 0 ? `
-      <div class="ct-header">
-        <span>Keyword (suffix match)</span>
-        <span>Group label</span>
-        <span></span>
-      </div>` : ""}
-      ${customRows}
-    </div>
-    <button class="btn-add" id="ct-add">+ Add type</button>
-  </div>
-
-  <!-- ── Name Cleaning ── -->
-  <div class="section-header">Name cleaning</div>
-  <div class="field-row col">
-    <label class="field-label">Words to remove from display names
-      <span class="field-hint">These words are stripped (case-insensitive) from entity names. Add or remove words to suit your naming convention.</span>
-    </label>
-    <div class="sw-list" id="sw-list">
-      ${stripWords.map((w, i) => `
-        <div class="sw-row">
-          <input class="text-input sw-word" type="text" value="${w.replace(/"/g, "&quot;")}" data-index="${i}" placeholder="word">
-          <button class="ct-remove sw-remove" data-index="${i}" title="Remove">✕</button>
-        </div>`).join("")}
-    </div>
-    <button class="btn-add" id="sw-add">+ Add word</button>
-  </div>
-
-  <div class="field-row">
-    <label class="field-label" for="strip_group_word">Remove group name from display name
-      <span class="field-hint">Strip the group keyword (Motion, Door, Window, etc.) from each entity's display name.</span>
-    </label>
-    <ha-switch id="strip_group_word" ${stripGroupWord ? "checked" : ""}></ha-switch>
-  </div>
-
-  <!-- ── Timer increment ── -->
-  <div class="section-header">Timer increment</div>
-  <div class="field-row col">
-    <label class="field-label">+/- button step
-      <span class="field-hint">How much each + or − press adjusts a timer. Default: 1 minute.</span>
-    </label>
-    <div class="increment-row">
-      <input id="increment_step" class="num-input" type="number" min="1" max="999" step="1" value="${incrementStep}">
-      <select id="increment_unit" class="unit-select">
-        <option value="seconds" ${incrementUnit === "seconds" ? "selected" : ""}>seconds</option>
-        <option value="minutes" ${incrementUnit === "minutes" ? "selected" : ""}>minutes</option>
-        <option value="hours"   ${incrementUnit === "hours"   ? "selected" : ""}>hours</option>
-      </select>
-    </div>
-  </div>
-
-  <!-- ── Appearance ── -->
-  <div class="section-header">Appearance</div>
-
-  <!-- Toggle-only items (no font/color sub-options) -->
-  <div class="field-row">
-    <label class="field-label" for="show_button_labels">Show button labels
-      <span class="field-hint">Add text next to ▶ ⏸ ✕ ✓ icons.</span>
-    </label>
-    <ha-switch id="show_button_labels" ${showBtnLabels ? "checked" : ""}></ha-switch>
-  </div>
-
-  <!-- Last changed row — toggle + font size + color -->
-  <div class="field-row">
-    <label class="field-label" for="show_last_changed">Show last changed row
-      <span class="field-hint">Display a second line under each entity row showing when the switch and timer last changed.</span>
-    </label>
-    <ha-switch id="show_last_changed" ${showLastChanged ? "checked" : ""}></ha-switch>
-  </div>
-  <div class="sub-fields" id="last_changed_sub" style="${showLastChanged ? "" : "display:none"}">
-    <div class="field-row font-row">
-      <label class="field-label" for="font_size_last_changed">Font size
-        <span class="field-hint">Default: 11</span>
-      </label>
-      <input id="font_size_last_changed" class="num-input" type="number" min="8" max="24" step="1" value="${fontLastChanged}">
-    </div>
-    <div class="field-row col">
-      <label class="field-label">Color
-        <span class="field-hint">Leave blank to use the theme secondary text color.</span>
-      </label>
-      <div class="color-row">
-        <div class="color-swatch"><input type="color" id="color_last_changed_picker" value="${colorLastChanged.startsWith("#") ? colorLastChanged : "#9e9e9e"}"></div>
-        <input id="color_last_changed" class="text-input color-text" type="text" placeholder="var(--secondary-text-color) or #hex" value="${colorLastChanged.replace(/"/g, "&quot;")}">
-        <button class="color-clear" id="color_last_changed_clear">Reset</button>
-      </div>
-    </div>
-  </div>
-
-  <div class="field-row">
-    <label class="field-label" for="show_timer_badge">Show "timer only" badge
-      <span class="field-hint">Show an italic "timer only" label on rows that have a timer but no bypass switch.</span>
-    </label>
-    <ha-switch id="show_timer_badge" ${showBadge ? "checked" : ""}></ha-switch>
-  </div>
-
-  <!-- Card title — text + font size + color -->
-  <div class="field-row col">
-    <label class="field-label">Card title
-      <span class="field-hint">Shown at the top of the card.</span>
-    </label>
-    <input id="title" class="text-input" type="text" placeholder="BYPASS &amp; TIMER MANAGER"
-           value="${title.replace(/"/g, "&quot;")}">
-    <div class="sub-fields">
-      <div class="field-row font-row">
-        <label class="field-label" for="font_size_title">Font size
-          <span class="field-hint">Default: 13</span>
-        </label>
-        <input id="font_size_title" class="num-input" type="number" min="8" max="32" step="1" value="${fontTitle}">
-      </div>
-      <div class="field-row col">
-        <label class="field-label">Color
-          <span class="field-hint">Leave blank to use the theme color.</span>
-        </label>
-        <div class="color-row">
-          <div class="color-swatch"><input type="color" id="color_card_title_picker" value="${colorCardTitle.startsWith("#") ? colorCardTitle : "#9e9e9e"}"></div>
-          <input id="color_card_title" class="text-input color-text" type="text" placeholder="var(--secondary-text-color) or #hex" value="${colorCardTitle.replace(/"/g, "&quot;")}">
-          <button class="color-clear" id="color_card_title_clear">Reset</button>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <!-- Secondary info — text + font size + color -->
-  <div class="field-row col">
-    <label class="field-label">Secondary information text
-      <span class="field-hint">Optional line shown below the card title. Leave blank to hide.</span>
-    </label>
-    <input id="secondary_info_text" class="text-input" type="text" placeholder="e.g. v2026.05 · Main Floor"
-           value="${secInfoText.replace(/"/g, "&quot;")}">
-    <div class="sub-fields">
-      <div class="field-row font-row">
-        <label class="field-label" for="secondary_info_size">Font size
-          <span class="field-hint">Default: 11</span>
-        </label>
-        <input id="secondary_info_size" class="num-input" type="number" min="8" max="32" step="1" value="${secInfoSize}">
-      </div>
-      <div class="field-row col">
-        <label class="field-label">Color
-          <span class="field-hint">Leave blank to use the theme accent color.</span>
-        </label>
-        <div class="color-row">
-          <div class="color-swatch"><input type="color" id="secondary_info_color_picker" value="${secInfoColor.startsWith("#") ? secInfoColor : "#03a9f4"}"></div>
-          <input id="secondary_info_color" class="text-input color-text" type="text" placeholder="var(--primary-color) or #hex" value="${secInfoColor.replace(/"/g, "&quot;")}">
-          <button class="color-clear" id="secondary_info_color_clear">Reset</button>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <!-- Entity names — toggle + font size + color (off state) -->
-  <div class="field-row">
-    <label class="field-label" for="show_entity_names">Show entity names
-      <span class="field-hint">Show the entity name on each row.</span>
-    </label>
-    <ha-switch id="show_entity_names" ${showEntityNames ? "checked" : ""}></ha-switch>
-  </div>
-  <div class="sub-fields">
-    <div class="field-row font-row">
-      <label class="field-label" for="font_size_name">Font size
-        <span class="field-hint">Default: 14</span>
-      </label>
-      <input id="font_size_name" class="num-input" type="number" min="8" max="32" step="1" value="${fontName}">
-    </div>
-    <div class="field-row col">
-      <label class="field-label">Color (Off state)
-        <span class="field-hint">Entity name color when bypass is off. Leave blank to use theme color.</span>
-      </label>
-      <div class="color-row">
-        <div class="color-swatch"><input type="color" id="color_entity_off_picker" value="${colorEntityOff.startsWith("#") ? colorEntityOff : "#212121"}"></div>
-        <input id="color_entity_off" class="text-input color-text" type="text" placeholder="var(--primary-text-color) or #hex" value="${colorEntityOff.replace(/"/g, "&quot;")}">
-        <button class="color-clear" id="color_entity_off_clear">Reset</button>
-      </div>
-    </div>
-  </div>
-
-  <!-- Group section titles — toggle + font size + color -->
-  <div class="field-row">
-    <label class="field-label" for="show_group_labels">Show group titles
-      <span class="field-hint">Show the Motion / Door / Window … headings above each group.</span>
-    </label>
-    <ha-switch id="show_group_labels" ${showGroupLabels ? "checked" : ""}></ha-switch>
-  </div>
-  <div class="sub-fields">
-    <div class="field-row font-row">
-      <label class="field-label" for="font_size_group">Font size
-        <span class="field-hint">Default: 11</span>
-      </label>
-      <input id="font_size_group" class="num-input" type="number" min="8" max="24" step="1" value="${fontGroup}">
-    </div>
-    <div class="field-row col">
-      <label class="field-label">Color
-        <span class="field-hint">Leave blank to use the theme color.</span>
-      </label>
-      <div class="color-row">
-        <div class="color-swatch"><input type="color" id="color_group_label_picker" value="${colorGroupLabel.startsWith("#") ? colorGroupLabel : "#9e9e9e"}"></div>
-        <input id="color_group_label" class="text-input color-text" type="text" placeholder="var(--secondary-text-color) or #hex" value="${colorGroupLabel.replace(/"/g, "&quot;")}">
-        <button class="color-clear" id="color_group_label_clear">Reset</button>
-      </div>
-    </div>
-  </div>
-
-  <!-- Divider lines — toggle + color -->
-  <div class="field-row">
-    <label class="field-label" for="show_dividers">Show divider lines
-      <span class="field-hint">Show the horizontal rule between groups.</span>
-    </label>
-    <ha-switch id="show_dividers" ${showDividers ? "checked" : ""}></ha-switch>
-  </div>
-  <div class="sub-fields">
-    <div class="field-row col">
-      <label class="field-label">Divider color
-        <span class="field-hint">Leave blank to use the theme color.</span>
-      </label>
-      <div class="color-row">
-        <div class="color-swatch"><input type="color" id="color_divider_picker" value="${colorDivider.startsWith("#") ? colorDivider : "#e0e0e0"}"></div>
-        <input id="color_divider" class="text-input color-text" type="text" placeholder="var(--divider-color) or #hex" value="${colorDivider.replace(/"/g, "&quot;")}">
-        <button class="color-clear" id="color_divider_clear">Reset</button>
-      </div>
-    </div>
-  </div>
-
-  <!-- On/Off toggle — toggle + active color -->
-  <div class="field-row">
-    <label class="field-label" for="show_toggle">Show on/off toggle
-      <span class="field-hint">Show the boolean bypass switch on each row.</span>
-    </label>
-    <ha-switch id="show_toggle" ${showToggle ? "checked" : ""}></ha-switch>
-  </div>
-  <div class="sub-fields">
-    <div class="field-row col">
-      <label class="field-label">'On' color
-        <span class="field-hint">Color of the switch and row label when active. Leave blank to use the theme color.</span>
-      </label>
-      <div class="color-row">
-        <div class="color-swatch"><input type="color" id="active_color_picker" value="${activeColor || "#03a9f4"}"></div>
-        <input id="active_color" class="text-input color-text" type="text" placeholder="var(--primary-color) or #hex" value="${activeColor.replace(/"/g, "&quot;")}">
-        <button class="color-clear" id="active_color_clear">Reset</button>
-      </div>
-    </div>
-  </div>
-
-  <!-- Timer controls — toggle only -->
-  <div class="field-row">
-    <label class="field-label" for="show_timer_controls">Show timer controls
-      <span class="field-hint">Show the Start / Pause / Cancel / Finish buttons.</span>
-    </label>
-    <ha-switch id="show_timer_controls" ${showTimerControls ? "checked" : ""}></ha-switch>
-  </div>
-
-  <!-- Timer time control — toggle + countdown font size -->
-  <div class="field-row">
-    <label class="field-label" for="show_timer_input">Show timer time control
-      <span class="field-hint">Show the editable duration input, countdown, and +/− buttons.</span>
-    </label>
-    <ha-switch id="show_timer_input" ${showTimerInput ? "checked" : ""}></ha-switch>
-  </div>
-  <div class="sub-fields">
-    <div class="field-row font-row">
-      <label class="field-label" for="font_size_timer">Countdown font size
-        <span class="field-hint">Default: 13</span>
-      </label>
-      <input id="font_size_timer" class="num-input" type="number" min="8" max="32" step="1" value="${fontTimer}">
-    </div>
-  </div>
-
-</div>`;
-
-    // ── Title ──
-    const titleEl = this.shadowRoot.getElementById("title");
-    titleEl.addEventListener("change", () => this._set("title", titleEl.value || "BYPASS & TIMER MANAGER"));
-
-    // ── Discovery mode (segmented button group) ──
-    const modeGroup = this.shadowRoot.getElementById("discovery_mode_group");
-    const prefixRow = this.shadowRoot.getElementById("prefix_row");
-    const labelRow  = this.shadowRoot.getElementById("label_row");
-    modeGroup.querySelectorAll(".seg-btn").forEach(btn => {
-      btn.addEventListener("click", () => {
-        const mode = btn.dataset.mode;
-        this._set("discovery_mode", mode);
-        // Toggle visibility of the relevant sub-field rows
-        prefixRow.style.display = mode === "label"  ? "none" : "";
-        labelRow.style.display  = mode === "label"  ? ""     : "none";
-        // Update active button styling without full re-render
-        modeGroup.querySelectorAll(".seg-btn").forEach(b =>
-          b.classList.toggle("seg-on", b.dataset.mode === mode));
-      });
+  _wire() {
+    const all = (sel, fn) => this.querySelectorAll(sel).forEach(fn);
+    all('details.bmce-sec, details.bmce-sub', (d) => d.addEventListener('toggle', () => {
+      if (d.open) this._open.add(d.dataset.panel); else this._open.delete(d.dataset.panel);
+    }));
+    all('[data-key]', (el) => el.addEventListener('change', () => {
+      const key = el.dataset.key;
+      this._set(key, el.type === 'checkbox' ? el.checked : el.value.trim());
+      if (REVEAL_KEYS.has(key) || key === 'entity_prefix' || key === 'discovery_label') this._render();
+    }));
+    all('[data-skey]', (el) => {
+      const key = el.dataset.skey;
+      const out = () => this.querySelector(`[data-val="${key}"]`);
+      el.addEventListener('input', () => { const o = out(); if (o) o.textContent = key === 'increment_step' ? el.value : `${el.value}px`; });
+      el.addEventListener('change', () => { this._set(key, Number(el.value)); this._render(); });
     });
-
-    // ── Entity prefix ──
-    const prefixEl = this.shadowRoot.getElementById("entity_prefix");
-    prefixEl?.addEventListener("change", () => this._set("entity_prefix", prefixEl.value.trim() || "bypass_"));
-
-    // ── Discovery label ──
-    const discoveryLabelEl = this.shadowRoot.getElementById("discovery_label");
-    discoveryLabelEl?.addEventListener("change", () => this._set("discovery_label", discoveryLabelEl.value.trim() || "bypass"));
-
-    // ── Show button labels ──
-    const lblEl = this.shadowRoot.getElementById("show_button_labels");
-    lblEl.addEventListener("change", () => this._set("show_button_labels", lblEl.checked));
-
-    // ── Show timer badge ──
-    const badgeEl = this.shadowRoot.getElementById("show_timer_badge");
-    badgeEl.addEventListener("change", () => this._set("show_timer_badge", badgeEl.checked));
-
-    // ── Show/hide toggles ──
-    const showToggleEl         = this.shadowRoot.getElementById("show_toggle");
-    const showTimerInputEl     = this.shadowRoot.getElementById("show_timer_input");
-    const showTimerControlsEl  = this.shadowRoot.getElementById("show_timer_controls");
-    const showEntityNamesEl    = this.shadowRoot.getElementById("show_entity_names");
-    const showGroupLabelsEl    = this.shadowRoot.getElementById("show_group_labels");
-    const showDividersEl       = this.shadowRoot.getElementById("show_dividers");
-    showToggleEl.addEventListener("change",        () => this._set("show_toggle",         showToggleEl.checked));
-    showTimerInputEl.addEventListener("change",    () => this._set("show_timer_input",    showTimerInputEl.checked));
-    showTimerControlsEl.addEventListener("change", () => this._set("show_timer_controls", showTimerControlsEl.checked));
-    showEntityNamesEl.addEventListener("change",   () => this._set("show_entity_names",   showEntityNamesEl.checked));
-    showGroupLabelsEl.addEventListener("change",   () => this._set("show_group_labels",   showGroupLabelsEl.checked));
-    showDividersEl.addEventListener("change",      () => this._set("show_dividers",       showDividersEl.checked));
-
-    // ── Active color ──
-    const colorPicker = this.shadowRoot.getElementById("active_color_picker");
-    const colorText   = this.shadowRoot.getElementById("active_color");
-    const colorClear  = this.shadowRoot.getElementById("active_color_clear");
-    colorPicker.addEventListener("input", () => {
-      colorText.value = colorPicker.value;
-      this._set("active_color", colorPicker.value);
-    });
-    colorText.addEventListener("change", () => {
-      const v = colorText.value.trim();
-      if (/^#[0-9a-fA-F]{6}$/.test(v)) colorPicker.value = v;
-      this._set("active_color", v);
-    });
-    colorClear.addEventListener("click", () => {
-      colorText.value = ""; colorPicker.value = "#03a9f4";
-      this._set("active_color", "");
-    });
-
-    // ── Helper to wire up a color field ──
-    const wireColor = (key, pickerId, textId, clearId, fallback) => {
-      const picker = this.shadowRoot.getElementById(pickerId);
-      const text   = this.shadowRoot.getElementById(textId);
-      const clear  = this.shadowRoot.getElementById(clearId);
-      if (!picker || !text || !clear) return;
-      picker.addEventListener("input", () => {
-        text.value = picker.value;
-        this._set(key, picker.value);
-      });
-      text.addEventListener("change", () => {
-        const v = text.value.trim();
-        if (/^#[0-9a-fA-F]{6}$/.test(v)) picker.value = v;
-        this._set(key, v);
-      });
-      clear.addEventListener("click", () => {
-        text.value = ""; picker.value = fallback;
-        this._set(key, "");
-      });
-    };
-    wireColor("color_card_title",  "color_card_title_picker",  "color_card_title",  "color_card_title_clear",  "#9e9e9e");
-    wireColor("color_group_label", "color_group_label_picker", "color_group_label", "color_group_label_clear", "#9e9e9e");
-    wireColor("color_divider",     "color_divider_picker",     "color_divider",     "color_divider_clear",     "#e0e0e0");
-    wireColor("color_entity_off",  "color_entity_off_picker",  "color_entity_off",  "color_entity_off_clear",  "#212121");
-    wireColor("secondary_info_color", "secondary_info_color_picker", "secondary_info_color", "secondary_info_color_clear", "#03a9f4");
-    wireColor("color_last_changed",   "color_last_changed_picker",   "color_last_changed",   "color_last_changed_clear",   "#9e9e9e");
-
-    // ── Secondary info text ──
-    const secTextEl = this.shadowRoot.getElementById("secondary_info_text");
-    secTextEl?.addEventListener("change", () => this._set("secondary_info_text", secTextEl.value.trim()));
-
-    // ── Secondary info font size ──
-    const secSizeEl = this.shadowRoot.getElementById("secondary_info_size");
-    secSizeEl?.addEventListener("change", () => {
-      const v = parseInt(secSizeEl.value);
-      if (!isNaN(v) && v >= 8) this._set("secondary_info_size", v);
-    });
-
-    // ── Show last changed toggle (with conditional sub-fields) ──
-    const showLcEl         = this.shadowRoot.getElementById("show_last_changed");
-    const lcSubEl          = this.shadowRoot.getElementById("last_changed_sub");
-    showLcEl?.addEventListener("change", () => {
-      const on = showLcEl.checked;
-      this._set("show_last_changed", on);
-      if (lcSubEl) lcSubEl.style.display = on ? "" : "none";
-    });
-
-    // ── Last changed font size ──
-    const lcFontEl = this.shadowRoot.getElementById("font_size_last_changed");
-    lcFontEl?.addEventListener("change", () => {
-      const v = parseInt(lcFontEl.value);
-      if (!isNaN(v) && v >= 8) this._set("font_size_last_changed", v);
-    });
-
-    // ── Font sizes ──
-    ["font_size_title", "font_size_name", "font_size_group", "font_size_timer"].forEach(id => {
-      const el = this.shadowRoot.getElementById(id);
-      el.addEventListener("change", () => {
-        const v = parseInt(el.value);
-        if (!isNaN(v) && v >= 8) this._set(id, v);
-      });
-    });
-
-    // ── Timer increment step + unit ──
-    const incrStepEl = this.shadowRoot.getElementById("increment_step");
-    const incrUnitEl = this.shadowRoot.getElementById("increment_unit");
-    const saveIncrement = () => {
-      const v = parseInt(incrStepEl.value);
-      if (!isNaN(v) && v >= 1) this._set("increment_step", v);
-      this._set("increment_unit", incrUnitEl.value);
-    };
-    incrStepEl.addEventListener("change", saveIncrement);
-    incrUnitEl.addEventListener("change", saveIncrement);
-
-    // ── Custom types — helper to read all rows and save ──
-    const saveCustomTypes = () => {
-      const rows = [...this.shadowRoot.querySelectorAll(".ct-row")].map(row => ({
-        keyword: row.querySelector("[data-field=keyword]").value.trim(),
-        label:   row.querySelector("[data-field=label]").value.trim(),
-      })).filter(r => r.keyword || r.label);
-      this._set("custom_types", rows);
-      // Re-render so filter chips update; preserve scroll position
-      const scrollY = this.shadowRoot.host?.closest(".editor-container")?.scrollTop ?? 0;
+    all('[data-reset]', (b) => b.addEventListener('click', () => { this._set(b.dataset.reset, ''); this._render(); }));
+    all('[data-group]', (el) => el.addEventListener('change', () => {
+      const g = el.dataset.group;
+      const list = (this._config.hidden_types || []).filter((x) => x !== g);
+      if (!el.checked) list.push(g);
+      this._config.hidden_types = list;
+      this._emit();
+    }));
+    // Custom groups
+    const saveCt = (list) => { this._config.custom_types = list; this._emit(); this._render(); };
+    all('[data-ct]', (el) => el.addEventListener('change', () => {
+      const list = (this._config.custom_types || []).map((x) => ({ ...x }));
+      const item = list[Number(el.dataset.ct)];
+      if (!item) return;
+      const v = el.value.trim();
+      if (el.dataset.field === 'icon') { if (v) item.icon = v.includes(':') ? v : `mdi:${v}`; else delete item.icon; }
+      else item[el.dataset.field] = v;
+      saveCt(list);
+    }));
+    all('[data-ct-del]', (b) => b.addEventListener('click', () => {
+      const i = Number(b.dataset.ctDel);
+      const removed = (this._config.custom_types || [])[i];
+      const list = (this._config.custom_types || []).filter((_, j) => j !== i);
+      if (removed && removed.label && this._config.hidden_types) this._config.hidden_types = this._config.hidden_types.filter((g) => g !== removed.label);
+      saveCt(list);
+    }));
+    all('[data-ct-add]', (b) => b.addEventListener('click', () => {
+      // A new row is ignored by the card until it has both a keyword and a group name.
+      saveCt([...(this._config.custom_types || []), { keyword: '', label: '' }]);
+      const inputs = this.querySelectorAll('[data-field="keyword"]');
+      if (inputs.length) inputs[inputs.length - 1].focus();
+    }));
+    // Strip words
+    const saveSw = (list) => { this._config.strip_words = list; this._emit(); this._render(); };
+    all('[data-sw]', (el) => el.addEventListener('change', () => {
+      const list = [...(this._config.strip_words || ['bypass'])];
+      list[Number(el.dataset.sw)] = el.value.trim();
+      saveSw(list.filter(Boolean));
+    }));
+    all('[data-sw-del]', (b) => b.addEventListener('click', () => {
+      saveSw((this._config.strip_words || ['bypass']).filter((_, j) => j !== Number(b.dataset.swDel)));
+    }));
+    all('[data-sw-add]', (b) => b.addEventListener('click', () => {
+      this._config.strip_words = [...(this._config.strip_words || ['bypass']), ''];
       this._render();
-      this.shadowRoot.host?.closest(".editor-container")?.scrollTo(0, scrollY);
-    };
-
-    // Input changes on existing rows
-    this.shadowRoot.querySelectorAll(".ct-row input").forEach(inp => {
-      inp.addEventListener("change", saveCustomTypes);
-    });
-
-    // Remove buttons
-    this.shadowRoot.querySelectorAll(".ct-remove").forEach(btn => {
-      btn.addEventListener("click", () => {
-        const idx = parseInt(btn.dataset.index);
-        const next = [...customTypes];
-        next.splice(idx, 1);
-        this._set("custom_types", next);
-        this._render();
-      });
-    });
-
-    // Add button
-    this.shadowRoot.getElementById("ct-add").addEventListener("click", () => {
-      const next = [...customTypes, { keyword: "", label: "" }];
-      this._set("custom_types", next);
+      const inputs = this.querySelectorAll('[data-sw]');
+      if (inputs.length) inputs[inputs.length - 1].focus();
+    }));
+    // Colors (four-mode control)
+    all('.bmce-cmode', (sel) => sel.addEventListener('change', () => {
+      const key = sel.dataset.ckey;
+      const cur = this._config[key] || '';
+      const was = colorMode(cur);
+      let next = '';
+      // Seed the new mode from the old value; never drop the user's color on a mode change.
+      if (sel.value === 'theme') next = was === 'theme' ? cur : 'var(--primary-color)';
+      else if (sel.value === 'custom') next = /^#[0-9a-fA-F]{6}$/.test(cur) ? cur : sel.dataset.seed;
+      else if (sel.value === 'css') next = cur;
+      this._cmode[key] = sel.value;
+      this._set(key, next);
       this._render();
-      // Focus the new keyword input
-      const rows = this.shadowRoot.querySelectorAll(".ct-row");
-      rows[rows.length - 1]?.querySelector("[data-field=keyword]")?.focus();
-    });
-
-    // ── Strip words ──
-    const saveStripWords = () => {
-      const words = [...this.shadowRoot.querySelectorAll(".sw-word")]
-        .map(el => el.value.trim()).filter(Boolean);
-      this._set("strip_words", words.length > 0 ? words : ["bypass"]);
-      const scrollY = this.shadowRoot.host?.closest(".editor-container")?.scrollTop ?? 0;
-      this._render();
-      this.shadowRoot.host?.closest(".editor-container")?.scrollTo(0, scrollY);
-    };
-    this.shadowRoot.querySelectorAll(".sw-word").forEach(inp =>
-      inp.addEventListener("change", saveStripWords));
-    this.shadowRoot.querySelectorAll(".sw-remove").forEach(btn =>
-      btn.addEventListener("click", () => {
-        const next = [...stripWords];
-        next.splice(parseInt(btn.dataset.index), 1);
-        this._set("strip_words", next.length > 0 ? next : []);
-        this._render();
-      }));
-    this.shadowRoot.getElementById("sw-add")?.addEventListener("click", () => {
-      const next = [...stripWords, ""];
-      this._set("strip_words", next);
-      this._render();
-      const rows = this.shadowRoot.querySelectorAll(".sw-word");
-      rows[rows.length - 1]?.focus();
-    });
-
-    // ── Strip group word toggle ──
-    const stripGroupEl = this.shadowRoot.getElementById("strip_group_word");
-    stripGroupEl?.addEventListener("change", () => this._set("strip_group_word", stripGroupEl.checked));
-
-    // ── Group filter chips ──
-    this.shadowRoot.querySelectorAll(".filter-check").forEach(cb => {
-      cb.addEventListener("change", () => {
-        const checked = [...this.shadowRoot.querySelectorAll(".filter-check")]
-          .filter(c => c.checked).map(c => c.dataset.group);
-        if (checked.length === 0) { cb.checked = true; return; }
-        cb.closest(".chip").classList.toggle("chip-on", cb.checked);
-        this._set("type_filters", checked);
-      });
-    });
+    }));
+    all('.bmce-ctheme', (el) => el.addEventListener('change', () => this._set(el.dataset.ckey, el.value)));
+    all('.bmce-chex', (el) => el.addEventListener('input', () => this._set(el.dataset.ckey, el.value)));
+    all('.bmce-ccss', (el) => el.addEventListener('change', () => this._set(el.dataset.ckey, el.value.trim())));
   }
 }
 
-customElements.define("bypass-manager-card-editor", BypassManagerCardEditor);
+// Test hooks (pure helpers; no effect in the browser)
+BypassManagerCard._test = {
+  BUILD_NUMBER, VERSION, CARD_CSS, EDITOR_CSS, DEFAULTS, COLOR_DEFS, GROUP_ORDER, LEGACY_GROUPS,
+  normalizeConfig, groupFor, cleanDisplayName, discover, buildSections, columns, rootStyleVars, colorMode,
+  fmtSecs, fmtDuration, fmtRelTime, fmtClock, parseInput, durationToSecs, secsToHMS,
+};
+
+if (!customElements.get(CARD_TAG)) customElements.define(CARD_TAG, BypassManagerCard);
+if (!customElements.get(EDITOR_TAG)) customElements.define(EDITOR_TAG, BypassManagerCardEditor);
+
 window.customCards = window.customCards || [];
-window.customCards.push({
-  type:        "bypass-manager-card",
-  name:        "Bypass Manager Card",
-  description: "Auto-discovers bypass input_boolean + timer pairs and groups them by type.",
-});
+if (!window.customCards.some((c) => c.type === CARD_TAG)) {
+  window.customCards.push({
+    type: CARD_TAG,
+    name: 'Bypass & Timer Manager Card',
+    description: 'Finds every bypass switch and timer, pairs and groups them, with full timer control.',
+    preview: false,
+    documentationURL: 'https://github.com/Ltek/bypass-manager-card',
+  });
+}
+
+console.info(`%c BYPASS-MANAGER-CARD %c ${BUILD_NUMBER} `, 'color:#fff;background:#2196F3;font-weight:700', 'color:#2196F3;background:transparent');
