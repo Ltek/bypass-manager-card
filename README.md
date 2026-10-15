@@ -2,7 +2,7 @@
 
 [![Add to HACS](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=Ltek&repository=bypass-manager-card&category=plugin)
 
-Current build: **v2026.10.15.33** · full history in [CHANGELOG.md](CHANGELOG.md)
+Current build: **v2026.10.15.34** · full history in [CHANGELOG.md](CHANGELOG.md)
 
 A Home Assistant Dashboard card for **all** your bypass helpers: security zones, doors, windows,
 motion, lights, scenes, locks, weather and anything else. It finds every bypass `input_boolean`
@@ -24,8 +24,9 @@ timer control. There's a visual editor for every setting.
 - **Last changed** line per row, with the clock time if you want it.
 - **Title line** with an active count ("3 active" / "All off") and an optional glow while anything is on.
 - **Create and delete helpers** from the card (admins only): a Timer, a Switch, or a matched set of both,
-  named the card's way (`bypass_door_patio`). YAML helpers are locked.
-- **Groups** in your own order, each one shown or hidden, and optionally collapsible (starting open or collapsed).
+  named the card's way (`bypass_door_patio`), in an area when grouping by area. YAML helpers are locked.
+- **Groups by type or by area**, in your own order, each one shown or hidden, and optionally collapsible
+  (starting open or collapsed).
 - Every color follows your theme or can be custom; every size is a slider.
 
 ## Installation
@@ -80,6 +81,14 @@ hidden_types: [Other] # groups to leave off the card
 Names drop the word `bypass` and the group word: `bypass_door_front` shows as **Front**,
 `bypass_lock_front_door` as **Front Door**.
 
+## Group by area
+
+`group_by: area` groups rows by Home Assistant area instead of by type. A row takes its switch's area, else
+its timer's; an entity without its own area uses its device's. Bypasses without an area go in **No area**.
+Areas have their own order, hide and start-collapsed lists (`area_order`, `hidden_areas`, `collapsed_areas`,
+by area ID), so switching back to type groups keeps your type settings. Row icons and names still come from
+the type groups.
+
 ## Create & delete
 
 Turn on `allow_create` and / or `allow_delete`. A **Manage** section appears under the title, collapsed.
@@ -110,6 +119,8 @@ Every option is in the visual editor. Leave an option out to get its default.
 | `custom_types` | none | `[{ keyword, label, icon }]` |
 | `group_order` | default order | Groups in your order (set with the ↑ / ↓ arrows) |
 | `group_rows` | `true` | `false` = one flat list |
+| `group_by` | `type` | `area` = group by Home Assistant area |
+| `area_order` / `hidden_areas` / `collapsed_areas` | none | Area IDs: order, hidden, start collapsed (area grouping) |
 | `collapsible_groups` | `false` | Tap a group title to fold it |
 | `collapsed_groups` | none | Groups that start collapsed |
 | `allow_create` | `false` | Manage section: create a Timer, Switch or Matched set (admins only) |

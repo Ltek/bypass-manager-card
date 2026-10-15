@@ -1,5 +1,19 @@
 # Changelog
 
+## v2026.10.15.34
+
+**New**
+- **Group by area** (`group_by: area`). Rows group by their Home Assistant area instead of by type: the
+  switch's area, else the timer's (an entity's own area, else its device's). Bypasses without an area go in
+  **No area**, listed last; the rest are by name.
+- Areas get the same row controls as type groups: ↑ / ↓ order (`area_order`), show / hide (`hidden_areas`)
+  and start open or collapsed (`collapsed_areas`). These are kept apart from the type settings, so switching
+  between the two loses nothing.
+- Creating a helper while grouping by area adds an **Area** picker; the new helper is put in that area.
+
+**Settings**
+- **Group rows** is now one choice in Groups & order: By type, By area, or Don't group (one list).
+
 ## v2026.10.15.33
 
 **New**

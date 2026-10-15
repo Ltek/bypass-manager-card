@@ -1,5 +1,5 @@
 // Bypass & Timer Manager Card — Home Assistant Dashboard card for bypass switches + timers
-// Version: v2026.10.15.33
+// Version: v2026.10.15.34
 //
 // Finds every bypass input_boolean and timer (by entity-ID prefix or by HA label),
 // pairs each switch with the timer of the same name, groups them by type and gives
@@ -21,13 +21,15 @@
 // (timer/delete, input_boolean/delete by their registry unique_id). YAML helpers are locked.
 //
 // Groups can be reordered (group_order), hidden (hidden_types) and made collapsible
-// (collapsible_groups, with collapsed_groups starting collapsed).
+// (collapsible_groups, with collapsed_groups starting collapsed). group_by: area groups by
+// Home Assistant area instead (switch's area, else the timer's; entity, else device), with
+// its own area_order / hidden_areas / collapsed_areas so switching back loses nothing.
 //
 // Vanilla JS, single file. The card stylesheet is a constant (no config values are
 // interpolated into it); per-card values are custom properties set inline on the
 // card root. The card renders once and patches itself on every state change.
 
-const BUILD_NUMBER = 'v2026.10.15.33';
+const BUILD_NUMBER = 'v2026.10.15.34';
 const VERSION = BUILD_NUMBER.slice(1);
 const CARD_TAG = 'bypass-manager-card';
 const EDITOR_TAG = 'bypass-manager-card-editor';
@@ -115,7 +117,7 @@ function planHelperName(c, rawName, group) {
   const warnings = [];
   if (c.discovery_mode !== 'label' && !objectId.startsWith(prefix)) warnings.push(`doesn't start with your prefix "${prefix}", so the card won't find it`);
   if (group && lands !== group) warnings.push(`its name puts it in ${lands}, not ${group}`);
-  if ((c.hidden_types || []).includes(lands)) warnings.push(`the ${lands} group is hidden`);
+  if (!byArea(c) && (c.hidden_types || []).includes(lands)) warnings.push(`the ${lands} group is hidden`);
   return { suffix, objectId, name: titleWords(objectId), lands, warnings };
 }
 
@@ -211,22 +213,74 @@ function rowChanged(hass, row) {
   return Number.isFinite(t) ? t : 0;
 }
 
-/** Discovered rows → visible sections [{ section, rows }], grouped, filtered and sorted. */
+// ---------------------------------------------------------------------------
+// Areas (group_by: area)
+// ---------------------------------------------------------------------------
+const NO_AREA = '_none';
+const NO_AREA_NAME = 'No area';
+
+/** An entity's area: its own, else its device's. */
+function entityArea(hass, id) {
+  const e = id && hass && hass.entities && hass.entities[id];
+  if (!e) return null;
+  if (e.area_id) return e.area_id;
+  const d = e.device_id && hass.devices && hass.devices[e.device_id];
+  return (d && d.area_id) || null;
+}
+
+/** A row's area: the switch's, else the timer's, else "No area". */
+function rowArea(hass, row) {
+  return entityArea(hass, row.bool) || entityArea(hass, row.timer) || NO_AREA;
+}
+
+function areaName(hass, id) {
+  if (id === NO_AREA) return NO_AREA_NAME;
+  const a = hass && hass.areas && hass.areas[id];
+  return (a && a.name) || id;
+}
+
+function areaIcon(hass, id) {
+  if (id === NO_AREA) return 'mdi:help-rhombus-outline';
+  const a = hass && hass.areas && hass.areas[id];
+  return (a && a.icon) || 'mdi:texture-box';
+}
+
+/** The given areas in the user's order (`area_order`), then by name; "No area" last. */
+function orderedAreas(hass, c, present) {
+  const set = new Set(present);
+  const byName = [...set].sort((a, b) => ((a === NO_AREA) - (b === NO_AREA)) || areaName(hass, a).localeCompare(areaName(hass, b)));
+  return [...new Set([...(c.area_order || []).filter((a) => set.has(a)), ...byName])];
+}
+
+/** Grouping by area? (Only when rows are grouped at all.) */
+const byArea = (c) => c.group_by === 'area' && c.group_rows !== false;
+
+/** The config keys that hold the current grouping's hidden / start-collapsed / order lists. */
+const groupKeys = (c) => (byArea(c)
+  ? { hidden: 'hidden_areas', collapsed: 'collapsed_areas', order: 'area_order' }
+  : { hidden: 'hidden_types', collapsed: 'collapsed_groups', order: 'group_order' });
+
+/** Discovered rows → visible sections [{ key, section, rows }], grouped, filtered and sorted. */
 function buildSections(hass, c) {
   const custom = c.custom_types || [];
-  const hidden = new Set(c.hidden_types || []);
+  const area = byArea(c);
+  const hidden = new Set((area ? c.hidden_areas : c.hidden_types) || []);
   const strip = c.strip_words || ['bypass'];
   const rows = discover(hass, c).map((r) => {
     const g = groupFor(r.suffix, custom);
-    return { ...r, group: g.label, icon: g.icon, label: cleanDisplayName(r.suffix, strip, c.strip_group_word, custom) };
-  }).filter((r) => !hidden.has(r.group));
+    return { ...r, group: g.label, icon: g.icon, area: rowArea(hass, r), label: cleanDisplayName(r.suffix, strip, c.strip_group_word, custom) };
+  }).filter((r) => !hidden.has(area ? r.area : r.group));
   const byName = (a, b) => a.label.localeCompare(b.label);
   const sorter = c.sort === 'active'
     ? (a, b) => (rowIsOn(hass, b) - rowIsOn(hass, a)) || (rowChanged(hass, b) - rowChanged(hass, a)) || byName(a, b)
     : byName;
-  if (c.group_rows === false) return rows.length ? [{ section: '', rows: rows.sort(sorter) }] : [];
+  if (c.group_rows === false) return rows.length ? [{ key: '', section: '', rows: rows.sort(sorter) }] : [];
+  if (area) {
+    return orderedAreas(hass, c, rows.map((r) => r.area))
+      .map((a) => ({ key: a, section: areaName(hass, a), rows: rows.filter((r) => r.area === a).sort(sorter) }));
+  }
   return orderedGroups(c)
-    .map((g) => ({ section: g, rows: rows.filter((r) => r.group === g).sort(sorter) }))
+    .map((g) => ({ key: g, section: g, rows: rows.filter((r) => r.group === g).sort(sorter) }))
     .filter((s) => s.rows.length);
 }
 
@@ -241,6 +295,7 @@ const DEFAULTS = {
   discovery_label: 'bypass',
   sort: 'name',
   group_rows: true,
+  group_by: 'type',
   show_group_labels: true,
   show_dividers: true,
   show_icon: false,
@@ -328,7 +383,7 @@ function normalizeConfig(raw) {
     const o = orderedGroups(c);
     if (o.join('\n') === allGroups(c.custom_types).join('\n')) delete c.group_order; else c.group_order = o;
   } else delete c.group_order;
-  for (const k of ['hidden_types', 'custom_types', 'collapsed_groups']) if (Array.isArray(c[k]) && !c[k].length) delete c[k];
+  for (const k of ['hidden_types', 'custom_types', 'collapsed_groups', 'hidden_areas', 'collapsed_areas', 'area_order']) if (Array.isArray(c[k]) && !c[k].length) delete c[k];
   if (Array.isArray(c.strip_words) && c.strip_words.length === 1 && c.strip_words[0] === 'bypass') delete c.strip_words;
   return c;
 }
@@ -574,7 +629,7 @@ class BypassManagerCard extends HTMLElement {
     this._sig = '';
     this._groupOpen = {};   // group → open (seeded from collapsed_groups; kept across redraws)
     // The Manage section (create / delete). Lives here so a redraw never loses it. Starts collapsed.
-    this._mg = { open: false, create: null, del: false, group: '', name: '', dur: '5m', restore: false, busy: false, msg: null, confirm: null };
+    this._mg = { open: false, create: null, del: false, group: '', area: '', name: '', dur: '5m', restore: false, busy: false, msg: null, confirm: null };
     this.attachShadow({ mode: 'open' });
   }
 
@@ -636,13 +691,13 @@ class BypassManagerCard extends HTMLElement {
   _collapsible() { return !!(this._c('collapsible_groups') && this._c('group_rows')); }
 
   _isOpen(group) {
-    if (!(group in this._groupOpen)) this._groupOpen[group] = !(this._config.collapsed_groups || []).includes(group);
+    if (!(group in this._groupOpen)) this._groupOpen[group] = !(this._config[groupKeys(this._config).collapsed] || []).includes(group);
     return this._groupOpen[group];
   }
 
   /** What, if it changes, needs the rows rebuilt (not just patched): which entities exist and their order. */
   _signature() {
-    return this._sections.map((s) => `${s.section}:${s.rows.map((r) => `${r.bool || ''}|${r.timer || ''}`).join(',')}`).join(';');
+    return this._sections.map((s) => `${s.key}:${s.rows.map((r) => `${r.bool || ''}|${r.timer || ''}`).join(',')}`).join(';');
   }
 
   // ── Render (full) ───────────────────────────────────────────────────────
@@ -661,15 +716,15 @@ class BypassManagerCard extends HTMLElement {
     const sec = this._c('secondary_info_text');
     const collapsible = this._collapsible();
     const showGroups = (this._c('show_group_labels') || collapsible) && this._c('group_rows');
-    const groupHead = (g) => {
-      if (!collapsible) return `<div class="section-label">${esc(g)}</div>`;
-      const open = this._isOpen(g);
-      return `<button class="section-label sec-toggle${open ? '' : ' collapsed'}" data-sec-toggle="${esc(g)}" aria-expanded="${open}">`
-        + `<ha-icon class="sec-chev" icon="mdi:chevron-down"></ha-icon><span>${esc(g)}</span><span class="sec-on" data-sec-on="${esc(g)}"></span></button>`;
+    const groupHead = (s) => {
+      if (!collapsible) return `<div class="section-label">${esc(s.section)}</div>`;
+      const open = this._isOpen(s.key);
+      return `<button class="section-label sec-toggle${open ? '' : ' collapsed'}" data-sec-toggle="${esc(s.key)}" aria-expanded="${open}">`
+        + `<ha-icon class="sec-chev" icon="mdi:chevron-down"></ha-icon><span>${esc(s.section)}</span><span class="sec-on" data-sec-on="${esc(s.key)}"></span></button>`;
     };
     const body = this._sections.length
       ? this._sections.map((s, i) => `${i > 0 && this._c('show_dividers') && this._c('group_rows') ? '<div class="divider"></div>' : ''}${
-        showGroups && s.section ? groupHead(s.section) : ''}${s.rows.map((r) => this._rowHtml(r, cols, !!(collapsible && s.section && !this._isOpen(s.section)), s.section)).join('')}`).join('')
+        showGroups && s.key ? groupHead(s) : ''}${s.rows.map((r) => this._rowHtml(r, cols, !!(collapsible && s.key && !this._isOpen(s.key)), s.key)).join('')}`).join('')
       : '<div class="empty">No bypass switches or timers found.</div>';
     this.shadowRoot.innerHTML = `<style>${CARD_CSS}</style>
       <ha-card class="card" style="${esc(rootStyleVars(c, cols.map((x) => x[1]).join(' ') || '1fr'))}">
@@ -701,6 +756,9 @@ class BypassManagerCard extends HTMLElement {
       form = `<div class="mg-form">
           <select data-mg="group" title="Group: adds its word to the name"><option value="">Group: auto</option>${
             groups.map((g) => `<option value="${esc(g)}"${g === m.group ? ' selected' : ''}>${esc(g)}</option>`).join('')}</select>
+          ${byArea(this._config) ? `<select data-mg="area" title="Area for the new helper"><option value="">Area: none</option>${
+            Object.values(this._hass.areas || {}).sort((a, b) => String(a.name).localeCompare(String(b.name)))
+              .map((a) => `<option value="${esc(a.area_id)}"${a.area_id === m.area ? ' selected' : ''}>${esc(a.name)}</option>`).join('')}</select>` : ''}
           <input type="text" class="mg-name" data-mg="name" placeholder="Name, e.g. Patio" value="${esc(m.name)}">
           ${m.create !== 'switch' ? `<input type="text" class="mg-dur" data-mg="dur" title="Timer length: 30m, 1h, 1h30m, 90s" value="${esc(m.dur)}">
           <label class="mg-check" title="Pick up where it left off after Home Assistant restarts"><input type="checkbox" data-mg="restore"${m.restore ? ' checked' : ''}>Restore</label>` : ''}
@@ -745,7 +803,8 @@ class BypassManagerCard extends HTMLElement {
     const durBad = this._mg.create !== 'switch' && !parseInput(this._mg.dur);
     if (go) go.disabled = this._mg.busy || !p || !!p.exists.length || durBad;
     if (!p) { box.innerHTML = 'Type a name. The card adds the prefix and group word, e.g. <code>bypass_door_patio</code>.'; return; }
-    const parts = [`Creates ${p.ids.map((id) => `<code>${esc(id)}</code>`).join(' + ')} in <b>${esc(p.plan.lands)}</b>`];
+    const where = byArea(this._config) ? areaName(this._hass, this._mg.area || NO_AREA) : p.plan.lands;
+    const parts = [`Creates ${p.ids.map((id) => `<code>${esc(id)}</code>`).join(' + ')} in <b>${esc(where)}</b>`];
     if (p.pairs) parts.push(`pairs with <code>${esc(p.pairs)}</code>`);
     let html = parts.join(', ');
     if (p.exists.length) html += `<br><span class="bad">${p.exists.map(esc).join(' and ')} already exist${p.exists.length === 1 ? 's' : ''}.</span>`;
@@ -774,6 +833,10 @@ class BypassManagerCard extends HTMLElement {
         if (eid !== id) notes.push(`${id} was taken, so it is ${eid}`);
         if (this._config.discovery_mode === 'label') {
           try { await this._applyLabel(eid); } catch (e) { notes.push(`couldn't add the label to ${eid}: ${errText(e)}`); }
+        }
+        if (byArea(this._config) && m.area) {
+          try { await this._hass.callWS({ type: 'config/entity_registry/update', entity_id: eid, area_id: m.area }); }
+          catch (e) { notes.push(`couldn't set the area of ${eid}: ${errText(e)}`); }
         }
       } catch (e) { errs.push(`${id}: ${errText(e)}`); }
     }
@@ -908,6 +971,7 @@ class BypassManagerCard extends HTMLElement {
     on('[data-mg="name"], [data-mg="dur"]', 'input', (el) => { m[el.dataset.mg] = el.value; this._mgPreview(); });
     on('[data-mg="name"], [data-mg="dur"]', 'keydown', (el, e) => { if (e.key === 'Enter') this._create(); });
     on('[data-mg="group"]', 'change', (el) => { m.group = el.value; this._mgPreview(); });
+    on('[data-mg="area"]', 'change', (el) => { m.area = el.value; this._mgPreview(); });
     on('[data-mg="restore"]', 'change', (el) => { m.restore = el.checked; });
     on('[data-mg-go]', 'click', () => this._create());
     on('[data-del]', 'click', (el) => { m.confirm = m.confirm === el.dataset.del ? null : el.dataset.del; this._render(); });
@@ -943,7 +1007,7 @@ class BypassManagerCard extends HTMLElement {
   _update() {
     if (!this._hass) return;
     const next = buildSections(this._hass, this._config);
-    const sig = next.map((s) => `${s.section}:${s.rows.map((r) => `${r.bool || ''}|${r.timer || ''}`).join(',')}`).join(';');
+    const sig = next.map((s) => `${s.key}:${s.rows.map((r) => `${r.bool || ''}|${r.timer || ''}`).join(',')}`).join(';');
     // A bypass appeared / disappeared, or the active-first order changed: rebuild the rows.
     // Never while a time is being typed in a row — the next update catches up. (Manage fields
     // are fine: the redraw keeps their text and caret.)
@@ -984,9 +1048,9 @@ class BypassManagerCard extends HTMLElement {
     // A collapsed group still says how many of its bypasses are on.
     if (this._collapsible()) {
       for (const s of this._sections) {
-        const el = root.querySelector(`[data-sec-on="${cssEsc(s.section)}"]`);
+        const el = root.querySelector(`[data-sec-on="${cssEsc(s.key)}"]`);
         if (!el) continue;
-        const n = this._isOpen(s.section) ? 0 : s.rows.filter((r) => rowIsOn(h, r)).length;
+        const n = this._isOpen(s.key) ? 0 : s.rows.filter((r) => rowIsOn(h, r)).length;
         el.textContent = n ? `· ${n} on` : '';
       }
     }
@@ -1410,43 +1474,64 @@ class BypassManagerCardEditor extends HTMLElement {
       ${found}`;
   }
 
+  /** The groups the editor lists, in order: types, or (grouping by area) the areas that have bypasses. */
+  _groupEntries() {
+    const c = this._config;
+    const custom = c.custom_types || [];
+    const rows = this._hass ? discover(this._hass, c) : [];
+    const counts = {};
+    if (byArea(c)) {
+      rows.forEach((r) => { const a = rowArea(this._hass, r); counts[a] = (counts[a] || 0) + 1; });
+      return orderedAreas(this._hass, c, Object.keys(counts))
+        .map((a) => ({ key: a, name: areaName(this._hass, a), icon: areaIcon(this._hass, a), count: counts[a] }));
+    }
+    rows.forEach((r) => { const g = groupFor(r.suffix, custom).label; counts[g] = (counts[g] || 0) + 1; });
+    return orderedGroups(c).map((g) => ({ key: g, name: g, icon: groupIcon(g, custom), count: counts[g] || 0 }));
+  }
+
   _groupsBody() {
     const c = this._config;
     const custom = c.custom_types || [];
-    const hidden = new Set(c.hidden_types || []);
+    const keys = groupKeys(c);
+    const area = byArea(c);
+    const hidden = new Set(c[keys.hidden] || []);
     const grouped = this._c('group_rows');
     const collapsible = grouped && this._c('collapsible_groups');
-    const collapsed = new Set(c.collapsed_groups || []);
-    const order = orderedGroups(c);
-    const rows = this._hass ? discover(this._hass, c) : [];
-    const counts = {};
-    rows.forEach((r) => { const g = groupFor(r.suffix, custom).label; counts[g] = (counts[g] || 0) + 1; });
+    const collapsed = new Set(c[keys.collapsed] || []);
+    const entries = this._groupEntries();
+    const grouping = !grouped ? 'none' : area ? 'area' : 'type';
     const act = (attr, val, icon, title, { disabled = false, on = false } = {}) => `<button class="bmce-act${on ? ' on' : ''}" ${attr}="${esc(val)}" title="${esc(title)}"${
       disabled ? ' disabled' : ''}><ha-icon icon="${icon}"></ha-icon></button>`;
-    const legend = [grouped && 'arrows set the order', 'the eye shows or hides a group', collapsible && 'the chevron sets whether it starts open (⌄) or collapsed (›)'].filter(Boolean);
-    return `<p class="bmce-hint">Each bypass lands in a group by the first type word in its name (motion, door, window, light, lock, scene, alarm, weather), or in Other.</p>
-      <div class="bmce-group first">Groups</div>
+    const legend = [grouped && 'arrows set the order', `the eye shows or hides ${area ? 'an area' : 'a group'}`, collapsible && 'the chevron sets whether it starts open (⌄) or collapsed (›)'].filter(Boolean);
+    const intro = area
+      ? `Each bypass goes in its Home Assistant area: the switch's area, else the timer's (an entity's own area, else its device's). Ones without an area go in ${NO_AREA_NAME}.`
+      : 'Each bypass lands in a group by the first type word in its name (motion, door, window, light, lock, scene, alarm, weather), or in Other.';
+    return `<p class="bmce-hint">${intro}</p>
+      <div class="bmce-row"><label class="lbl">Group rows</label><select data-grouping>${[['type', 'By type'], ['area', 'By area'], ['none', 'Don\'t group (one list)']]
+    .map(([v, n]) => `<option value="${v}"${v === grouping ? ' selected' : ''}>${n}</option>`).join('')}</select></div>
+      <div class="bmce-group">${area ? 'Areas' : 'Groups'}</div>
       <p class="bmce-hint">On each row, ${legend.join(', ')}.${grouped ? '' : ' Order applies when rows are grouped.'}</p>
-      <div class="bmce-list">${order.map((g, i) => {
+      ${area && !entries.length ? '<p class="bmce-hint">No areas yet: the list fills in once Home Assistant has loaded.</p>' : ''}
+      <div class="bmce-list">${entries.map(({ key: g, name, icon, count }, i) => {
         const off = hidden.has(g);
         const startsCollapsed = collapsed.has(g);
         return `<div class="bmce-item bmce-grp${off ? ' off' : ''}" data-grp-row="${esc(g)}">
-          <ha-icon icon="${esc(groupIcon(g, custom))}"></ha-icon>
-          <span class="bmce-name">${esc(g)}</span>${this._hass ? `<span class="bmce-badge" title="Bypasses in this group">${counts[g] || 0}</span>` : ''}
-          ${grouped ? `${act('data-grp-up', i, 'mdi:arrow-up', 'Move up', { disabled: i === 0 })}${act('data-grp-down', i, 'mdi:arrow-down', 'Move down', { disabled: i === order.length - 1 })}` : ''}
+          <ha-icon icon="${esc(icon)}"></ha-icon>
+          <span class="bmce-name">${esc(name)}</span>${this._hass ? `<span class="bmce-badge" title="Bypasses in this ${area ? 'area' : 'group'}">${count || 0}</span>` : ''}
+          ${grouped ? `${act('data-grp-up', i, 'mdi:arrow-up', 'Move up', { disabled: i === 0 })}${act('data-grp-down', i, 'mdi:arrow-down', 'Move down', { disabled: i === entries.length - 1 })}` : ''}
           ${act('data-grp-vis', g, off ? 'mdi:eye-off-outline' : 'mdi:eye-outline', off ? 'Hidden: tap to show' : 'Shown: tap to hide', { on: !off })}
           ${collapsible ? act('data-grp-start', g, startsCollapsed ? 'mdi:chevron-right' : 'mdi:chevron-down',
     startsCollapsed ? 'Starts collapsed: tap to start open' : 'Starts open: tap to start collapsed', { disabled: off }) : ''}
         </div>`;
       }).join('')}</div>
-      ${c.group_order ? '<button class="bmce-add" data-grp-reset>↺ Default order</button>' : ''}
+      ${c[keys.order] ? '<button class="bmce-add" data-grp-reset>↺ Default order</button>' : ''}
       <div class="bmce-group">Layout</div>
-      ${this._check('group_rows', 'Group rows by type', '(off: one list)')}
       ${grouped ? `${this._check('collapsible_groups', 'Groups can be collapsed', '(tap a group title)')}${
     collapsible ? '' : this._check('show_group_labels', 'Show group titles')}${this._check('show_dividers', 'Show a line between groups')}` : ''}
       ${this._select('sort', 'Row order', [['name', 'By name'], ['active', 'Active first, newest change first']])}
       <div class="bmce-group">Custom groups</div>
-      <p class="bmce-hint">A keyword found anywhere in a name puts it in your group. Custom groups are checked before the built-in ones.</p>
+      <p class="bmce-hint">A keyword found anywhere in a name puts it in your group. Custom groups are checked before the built-in ones.${
+  area ? ' While grouping by area, groups still set each row\'s icon and the word dropped from its name.' : ''}</p>
       <div class="bmce-list">
         <button class="bmce-add" data-ct-add>+ Group</button>
         ${custom.map((ct, i) => `<div class="bmce-item">
@@ -1568,23 +1653,28 @@ class BypassManagerCardEditor extends HTMLElement {
     all('[data-reset]', (b) => b.addEventListener('click', () => { this._set(b.dataset.reset, ''); this._render(); }));
     // Group rows: order, show / hide, start open / collapsed
     const move = (i, d) => {
-      const o = orderedGroups(this._config);
+      const o = this._groupEntries().map((e) => e.key);
       const j = i + d;
       if (j < 0 || j >= o.length) return;
       [o[i], o[j]] = [o[j], o[i]];
-      this._config.group_order = o;
+      this._config[groupKeys(this._config).order] = o;
       this._emit(); this._render();
     };
+    all('[data-grouping]', (el) => el.addEventListener('change', () => {
+      if (el.value === 'none') this._config.group_rows = false; else delete this._config.group_rows;
+      if (el.value === 'area') this._config.group_by = 'area'; else if (el.value === 'type') delete this._config.group_by;
+      this._emit(); this._render();
+    }));
     all('[data-grp-up]', (b) => b.addEventListener('click', () => move(Number(b.dataset.grpUp), -1)));
     all('[data-grp-down]', (b) => b.addEventListener('click', () => move(Number(b.dataset.grpDown), 1)));
-    all('[data-grp-reset]', (b) => b.addEventListener('click', () => { delete this._config.group_order; this._emit(); this._render(); }));
+    all('[data-grp-reset]', (b) => b.addEventListener('click', () => { delete this._config[groupKeys(this._config).order]; this._emit(); this._render(); }));
     const flip = (key, g) => {
       const list = this._config[key] || [];
       this._config[key] = list.includes(g) ? list.filter((x) => x !== g) : [...list, g];
       this._emit(); this._render();
     };
-    all('[data-grp-vis]', (b) => b.addEventListener('click', () => flip('hidden_types', b.dataset.grpVis)));
-    all('[data-grp-start]', (b) => b.addEventListener('click', () => flip('collapsed_groups', b.dataset.grpStart)));
+    all('[data-grp-vis]', (b) => b.addEventListener('click', () => flip(groupKeys(this._config).hidden, b.dataset.grpVis)));
+    all('[data-grp-start]', (b) => b.addEventListener('click', () => flip(groupKeys(this._config).collapsed, b.dataset.grpStart)));
     // Custom groups
     const saveCt = (list) => { this._config.custom_types = list; this._emit(); this._render(); };
     // A renamed group keeps its place, visibility and start state.
