@@ -1,5 +1,5 @@
 // Bypass & Timer Manager Card — Home Assistant Dashboard card for bypass switches + timers
-// Version: v2026.10.15.34
+// Version: v2026.10.15.35
 //
 // Finds every bypass input_boolean and timer (by entity-ID prefix or by HA label),
 // pairs each switch with the timer of the same name, groups them by type and gives
@@ -25,11 +25,14 @@
 // Home Assistant area instead (switch's area, else the timer's; entity, else device), with
 // its own area_order / hidden_areas / collapsed_areas so switching back loses nothing.
 //
+// show_unpaired: a collapsible section at the bottom lists every switch or timer without a
+// partner, with the closest-looking helper of the other kind as a "possible match".
+//
 // Vanilla JS, single file. The card stylesheet is a constant (no config values are
 // interpolated into it); per-card values are custom properties set inline on the
 // card root. The card renders once and patches itself on every state change.
 
-const BUILD_NUMBER = 'v2026.10.15.34';
+const BUILD_NUMBER = 'v2026.10.15.35';
 const VERSION = BUILD_NUMBER.slice(1);
 const CARD_TAG = 'bypass-manager-card';
 const EDITOR_TAG = 'bypass-manager-card-editor';
@@ -201,6 +204,78 @@ function discover(hass, c) {
     .map((suffix) => ({ suffix, bool: booleans[suffix] || null, timer: timers[suffix] || null }));
 }
 
+// ---------------------------------------------------------------------------
+// Unpaired helpers (show_unpaired)
+// ---------------------------------------------------------------------------
+// A switch pairs with the timer of the same name. Anything left over is listed, with the
+// closest-looking helper of the other kind as a "possible match" when one is close enough.
+const NOISE_WORDS = new Set(['bypass', 'timer', 'switch', 'toggle', 'helper', 'boolean', 'input']);
+const MATCH_MIN = 0.6;
+
+/** Object id → its meaningful words, singular, sorted: "bypass_windows_front" → ["front", "window"]. */
+function matchWords(objectId, prefix) {
+  const noise = new Set([...NOISE_WORDS, ...slugify(prefix).split('_').filter(Boolean)]);
+  return [...new Set(String(objectId).split('_').filter((w) => w && !noise.has(w))
+    .map((w) => (w.length > 3 && w.endsWith('s') && !w.endsWith('ss') ? w.slice(0, -1) : w)))].sort();
+}
+
+function levenshtein(a, b) {
+  if (a === b) return 0;
+  let prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i];
+    for (let j = 1; j <= b.length; j++) cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    prev = cur;
+  }
+  return prev[b.length];
+}
+
+/** How alike two object ids look → { score 0..1, reason } (null when not alike). */
+function likeness(idA, idB, prefix) {
+  const a = matchWords(idA, prefix);
+  const b = matchWords(idB, prefix);
+  if (!a.length || !b.length) return null;
+  const shared = a.filter((w) => b.includes(w));
+  const jaccard = shared.length / new Set([...a, ...b]).size;
+  const ja = a.join('_'); const jb = b.join('_');
+  const spelling = 1 - levenshtein(ja, jb) / Math.max(ja.length, jb.length);
+  const score = Math.max(jaccard, spelling);
+  if (score < MATCH_MIN || (!shared.length && spelling < 0.8)) return null;
+  let reason;
+  if (jaccard === 1) {
+    const rawA = String(idA).split('_'); const rawB = String(idB).split('_');
+    reason = rawA.length === rawB.length && rawA.filter((w) => !rawB.includes(w)).length === 0 ? 'same words, different order'
+      : 'same words, different prefix or wording';
+  } else if (spelling > jaccard + 0.01 || !shared.length) reason = 'similar spelling';
+  else reason = `shares ${shared.join(', ')}`;
+  return { score, reason };
+}
+
+/**
+ * The bypass helpers with no partner → [{ id, kind: 'switch'|'timer', missing, expected, match }].
+ * `expected` is the partner ID the pairing rule wants; `match` is the closest existing helper of
+ * the other kind that isn't already in a pair ({ id, score, reason }) or null.
+ */
+function findUnpaired(hass, c) {
+  const rows = discover(hass, c);
+  const paired = new Set(rows.filter((r) => r.bool && r.timer).flatMap((r) => [r.bool, r.timer]));
+  const prefix = c.entity_prefix || 'bypass_';
+  const ids = Object.keys((hass && hass.states) || {});
+  const pool = { timer: ids.filter((id) => id.startsWith('timer.') && !paired.has(id)),
+    input_boolean: ids.filter((id) => id.startsWith('input_boolean.') && !paired.has(id)) };
+  return rows.filter((r) => !r.bool || !r.timer).map((r) => {
+    const id = r.bool || r.timer;
+    const [domain, objectId] = id.split('.');
+    const other = domain === 'timer' ? 'input_boolean' : 'timer';
+    let match = null;
+    for (const cand of pool[other]) {
+      const l = likeness(objectId, cand.split('.')[1], prefix);
+      if (l && (!match || l.score > match.score || (l.score === match.score && cand < match.id))) match = { id: cand, ...l };
+    }
+    return { id, kind: r.bool ? 'switch' : 'timer', missing: r.bool ? 'timer' : 'switch', expected: `${other}.${objectId}`, match };
+  }).sort((x, y) => x.id.localeCompare(y.id));
+}
+
 /** On = the switch is on; a timer-only row is on while its timer runs. */
 function rowIsOn(hass, row) {
   const st = (id) => id && hass && hass.states[id] && hass.states[id].state;
@@ -318,6 +393,7 @@ const DEFAULTS = {
   collapsible_groups: false,
   allow_create: false,
   allow_delete: false,
+  show_unpaired: false,
   increment_step: 1,
   increment_unit: 'minutes',
   secondary_info_text: '',
@@ -576,6 +652,20 @@ const CARD_CSS = `
   .del-na { line-height: 0; color: var(--disabled-text-color, var(--secondary-text-color)); opacity: .6; }
   .row-confirm { grid-column: 1 / -1; display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 2px 16px 8px; font-size: 12px;
     color: var(--primary-text-color); }
+  .unpaired { margin-top: 8px; }
+  .unp-count { text-transform: none; letter-spacing: 0; font-weight: 500; opacity: .85; }
+  .unp-body { gap: 6px; }
+  .unp-item { display: flex; flex-direction: column; gap: 2px; padding: 4px 0; border-top: 1px solid var(--divider-color); }
+  .unp-item:first-child { border-top: none; }
+  .unp-line { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .unp-id { display: inline-flex; align-items: center; gap: 4px; border: none; background: none; padding: 0; cursor: pointer; text-align: left;
+    color: var(--primary-text-color); font-family: var(--code-font-family, monospace); font-size: 12px; word-break: break-all; }
+  .unp-id ha-icon { --mdc-icon-size: 16px; width: 16px; height: 16px; color: var(--secondary-text-color); flex: none; }
+  .unp-miss { font-size: 11px; color: var(--warning-color, #f4b942); }
+  .unp-sub { font-size: 11px; color: var(--secondary-text-color); padding-left: 20px; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .unp-sub .unp-id { font-size: 11px; color: var(--primary-color); }
+  .unp-why { font-style: italic; }
+  .unp-hint code { font-family: var(--code-font-family, monospace); }
   .row-confirm .muted { color: var(--secondary-text-color); font-size: 11px; }
 `;
 
@@ -629,6 +719,8 @@ class BypassManagerCard extends HTMLElement {
     this._sig = '';
     this._groupOpen = {};   // group → open (seeded from collapsed_groups; kept across redraws)
     // The Manage section (create / delete). Lives here so a redraw never loses it. Starts collapsed.
+    this._unpOpen = false;  // the Unpaired section starts collapsed
+    this._unpSig = '';
     this._mg = { open: false, create: null, del: false, group: '', area: '', name: '', dur: '5m', restore: false, busy: false, msg: null, confirm: null };
     this.attachShadow({ mode: 'open' });
   }
@@ -711,6 +803,8 @@ class BypassManagerCard extends HTMLElement {
     try { caret = focusKey && ae.selectionStart != null ? [ae.selectionStart, ae.selectionEnd] : null; } catch (e) { caret = null; }
     this._sections = buildSections(this._hass, c);
     this._sig = this._signature();
+    this._unpaired = this._c('show_unpaired') ? findUnpaired(this._hass, c) : [];
+    this._unpSig = this._unpairedSig(this._unpaired);
     const cols = columns(c, this._delMode());
     const title = this._c('title');
     const sec = this._c('secondary_info_text');
@@ -733,6 +827,7 @@ class BypassManagerCard extends HTMLElement {
         ${sec ? `<div class="card-secondary">${esc(sec)}</div>` : ''}
         ${this._canManage() ? this._manageHtml() : ''}
         ${body}
+        ${this._unpairedHtml()}
       </ha-card>`;
     this._wire();
     this._syncTimerTimes();
@@ -742,6 +837,30 @@ class BypassManagerCard extends HTMLElement {
       const el = this.shadowRoot.querySelector(`[data-mg="${cssEsc(focusKey)}"]`);
       if (el) { el.focus(); if (caret) try { el.setSelectionRange(caret[0], caret[1]); } catch (e) { /* not a text field */ } }
     }
+  }
+
+  // ── Unpaired section ────────────────────────────────────────────────────
+  _unpairedSig(list) { return list.map((u) => `${u.id}>${u.match ? u.match.id : ''}`).join(','); }
+
+  _unpairedHtml() {
+    const list = this._unpaired || [];
+    if (!this._c('show_unpaired') || !list.length) return '';
+    const open = this._unpOpen;
+    const icon = (id) => (id.startsWith('timer.') ? 'mdi:timer-outline' : 'mdi:toggle-switch-outline');
+    const ent = (id) => `<button class="unp-id" data-more="${esc(id)}" title="Details"><ha-icon icon="${icon(id)}"></ha-icon>${esc(id)}</button>`;
+    const items = list.map((u) => `<div class="unp-item">
+        <div class="unp-line">${ent(u.id)}<span class="unp-miss">no ${u.missing}</span></div>
+        ${u.match ? `<div class="unp-sub">Possible match: ${ent(u.match.id)} <span class="unp-why">${esc(u.match.reason)}</span></div>
+        <div class="unp-sub unp-hint">To pair them, the IDs must match: <code>${esc(u.id)}</code> ↔ <code>${esc(u.expected)}</code></div>`
+    : `<div class="unp-sub unp-hint">Its partner would be <code>${esc(u.expected)}</code></div>`}
+      </div>`).join('');
+    const matches = list.filter((u) => u.match).length;
+    return `<div class="manage unpaired${open ? ' open' : ''}">
+        <button class="manage-head" data-unp-toggle aria-expanded="${open}"><ha-icon icon="mdi:link-variant-off"></ha-icon>Unpaired
+          <span class="unp-count">${list.length}${matches ? ` · ${matches} possible match${matches === 1 ? '' : 'es'}` : ''}</span>
+          <ha-icon class="chev" icon="mdi:chevron-down"></ha-icon></button>
+        ${open ? `<div class="manage-body unp-body">${items}</div>` : ''}
+      </div>`;
   }
 
   // ── Manage section (create / delete helpers) ────────────────────────────
@@ -963,6 +1082,7 @@ class BypassManagerCard extends HTMLElement {
       root.querySelectorAll(`[data-sec="${cssEsc(g)}"]`).forEach((x) => x.classList.toggle('sec-hidden', !open));
       this._patch();
     });
+    on('[data-unp-toggle]', 'click', () => { this._unpOpen = !this._unpOpen; this._render(); });
     // Manage section
     const m = this._mg;
     on('[data-mg-toggle]', 'click', () => { m.open = !m.open; this._render(); });
@@ -1012,7 +1132,9 @@ class BypassManagerCard extends HTMLElement {
     // Never while a time is being typed in a row — the next update catches up. (Manage fields
     // are fine: the redraw keeps their text and caret.)
     const ae = this.shadowRoot.activeElement;
-    if (sig !== this._sig && !(ae && ae.dataset && ae.dataset.input)) { this._render(); return; }
+    // The Unpaired list also changes when a look-alike helper outside the card appears or goes.
+    const unp = this._c('show_unpaired') ? this._unpairedSig(findUnpaired(this._hass, this._config)) : '';
+    if ((sig !== this._sig || unp !== this._unpSig) && !(ae && ae.dataset && ae.dataset.input)) { this._render(); return; }
     this._syncTimerTimes();
     this._patch();
   }
@@ -1362,7 +1484,7 @@ const EDITOR_CSS = `
 // Settings that show or hide other settings: changing one re-renders the editor.
 const REVEAL_KEYS = new Set(['discovery_mode', 'group_rows', 'show_group_labels', 'show_dividers', 'show_icon', 'show_entity_names',
   'show_toggle', 'show_timer_input', 'show_countdown', 'show_last_changed', 'show_active_count', 'secondary_info_text',
-  'collapsible_groups', 'allow_create', 'allow_delete', ...BTN_KEYS]);
+  'collapsible_groups', 'allow_create', 'allow_delete', 'show_unpaired', ...BTN_KEYS]);
 
 class BypassManagerCardEditor extends HTMLElement {
   constructor() {
@@ -1563,7 +1685,12 @@ class BypassManagerCardEditor extends HTMLElement {
       ${this._select('increment_unit', 'Step unit', [['seconds', 'Seconds'], ['minutes', 'Minutes'], ['hours', 'Hours']])}` : ''}
       <div class="bmce-group">Last changed</div>
       ${this._check('show_last_changed', 'Line under each row: when the switch and timer last changed')}
-      ${this._c('show_last_changed') ? this._check('show_exact_time', 'Also the clock time', '(2h 5m ago · 3:41 PM)') : ''}`;
+      ${this._c('show_last_changed') ? this._check('show_exact_time', 'Also the clock time', '(2h 5m ago · 3:41 PM)') : ''}
+      <div class="bmce-group">Unpaired helpers</div>
+      ${this._check('show_unpaired', 'List switches and timers without a match', '(collapsible, at the bottom)')}
+      ${this._c('show_unpaired') ? `<p class="bmce-hint">A switch pairs with the timer of the same name. Any left over are listed, with a <b>possible match</b>
+        when another helper's name looks like it belongs (same words in another order, a different prefix, a near spelling).${
+  this._hass ? ` Right now: <b>${findUnpaired(this._hass, this._config).length}</b> unpaired.` : ''} The list hides when everything is paired.</p>` : ''}`;
   }
 
   _headerBody() {
@@ -1753,7 +1880,7 @@ class BypassManagerCardEditor extends HTMLElement {
 BypassManagerCard._test = {
   BUILD_NUMBER, VERSION, CARD_CSS, EDITOR_CSS, DEFAULTS, COLOR_DEFS, GROUP_ORDER, LEGACY_GROUPS,
   normalizeConfig, groupFor, cleanDisplayName, discover, buildSections, columns, rootStyleVars, colorMode,
-  orderedGroups, planHelperName, slugify,
+  orderedGroups, planHelperName, slugify, findUnpaired, likeness, matchWords,
   fmtSecs, fmtDuration, fmtRelTime, fmtClock, parseInput, durationToSecs, secsToHMS,
 };
 

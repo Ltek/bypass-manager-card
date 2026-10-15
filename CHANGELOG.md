@@ -1,5 +1,19 @@
 # Changelog
 
+## v2026.10.15.35
+
+**New**
+- **Unpaired helpers** (`show_unpaired`). A collapsible section at the bottom of the card (starts collapsed)
+  lists every bypass switch with no timer and every timer with no switch. The header shows how many, and how
+  many have a possible match.
+- **Possible match:** for each one, the card looks through the other kind of helper (including ones outside
+  your prefix) for a name that looks like it belongs, and says why: *same words, different order*
+  (`door_front` / `front_door`), *same words, different prefix or wording* (`bypass_windows` / `window`),
+  *similar spelling* (`bathroom` / `bathrom`) or *shares door, front*. It also shows the exact ID the
+  pairing rule expects, so you know what to rename. Tap any ID for its details.
+- The section hides itself when everything is paired, and updates when a look-alike helper appears.
+- Setting: Rows & timer controls → **Unpaired helpers**, with a live count.
+
 ## v2026.10.15.34
 
 **New**

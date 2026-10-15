@@ -2,7 +2,7 @@
 
 [![Add to HACS](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=Ltek&repository=bypass-manager-card&category=plugin)
 
-Current build: **v2026.10.15.34** · full history in [CHANGELOG.md](CHANGELOG.md)
+Current build: **v2026.10.15.35** · full history in [CHANGELOG.md](CHANGELOG.md)
 
 A Home Assistant Dashboard card for **all** your bypass helpers: security zones, doors, windows,
 motion, lights, scenes, locks, weather and anything else. It finds every bypass `input_boolean`
@@ -25,6 +25,8 @@ timer control. There's a visual editor for every setting.
 - **Title line** with an active count ("3 active" / "All off") and an optional glow while anything is on.
 - **Create and delete helpers** from the card (admins only): a Timer, a Switch, or a matched set of both,
   named the card's way (`bypass_door_patio`), in an area when grouping by area. YAML helpers are locked.
+- **Unpaired list** (optional): every switch without a timer and timer without a switch, with a
+  *possible match* when another helper's name looks like it belongs.
 - **Groups by type or by area**, in your own order, each one shown or hidden, and optionally collapsible
   (starting open or collapsed).
 - Every color follows your theme or can be custom; every size is a slider.
@@ -89,6 +91,14 @@ Areas have their own order, hide and start-collapsed lists (`area_order`, `hidde
 by area ID), so switching back to type groups keeps your type settings. Row icons and names still come from
 the type groups.
 
+## Unpaired helpers
+
+`show_unpaired: true` adds a collapsible **Unpaired** section at the bottom. It lists each bypass switch
+with no timer of the same name, and each timer with no switch. When another helper's name looks like it
+belongs, it's shown as a **possible match** with the reason (same words in another order, a different
+prefix or wording, a near spelling, or shared words) and the exact ID the pair needs. Look-alikes outside
+your prefix count too. The section hides when everything is paired.
+
 ## Create & delete
 
 Turn on `allow_create` and / or `allow_delete`. A **Manage** section appears under the title, collapsed.
@@ -123,6 +133,7 @@ Every option is in the visual editor. Leave an option out to get its default.
 | `area_order` / `hidden_areas` / `collapsed_areas` | none | Area IDs: order, hidden, start collapsed (area grouping) |
 | `collapsible_groups` | `false` | Tap a group title to fold it |
 | `collapsed_groups` | none | Groups that start collapsed |
+| `show_unpaired` | `false` | Collapsible list of unpaired switches / timers, with possible matches |
 | `allow_create` | `false` | Manage section: create a Timer, Switch or Matched set (admins only) |
 | `allow_delete` | `false` | Manage section: delete helpers from their row (admins only) |
 | `sort` | `name` | `name`, or `active` (active first, newest change first) |
