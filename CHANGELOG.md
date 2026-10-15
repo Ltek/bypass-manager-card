@@ -1,5 +1,20 @@
 # Changelog
 
+## v2026.10.15.36
+
+**New**
+- **Edit helpers from the card** (`allow_edit`). An **Edit** chip in the Manage section puts a ✏️ on each
+  row. It opens an inline form for the row's switch (`input_boolean`) and timer:
+  - **Switch:** name, icon, and state at startup (last state / on / off).
+  - **Timer:** name, icon, length, and restore after restart.
+  - **Entity ID:** renames the switch and timer together, so they stay paired. A live preview shows each
+    rename and blocks IDs already in use. It's also how you pair an unpaired helper: give it its partner's ID.
+- Like Create and Delete: off by default, admins only, YAML helpers locked.
+
+**Fixed**
+- Typed times accept any h / m / s mix and H:MM[:SS]. Before, a time like `1h 05m 30s` (the way the card
+  shows it) couldn't be typed back in.
+
 ## v2026.10.15.35
 
 **New**

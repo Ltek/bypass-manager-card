@@ -1,5 +1,5 @@
 // Bypass & Timer Manager Card — Home Assistant Dashboard card for bypass switches + timers
-// Version: v2026.10.15.35
+// Version: v2026.10.15.36
 //
 // Finds every bypass input_boolean and timer (by entity-ID prefix or by HA label),
 // pairs each switch with the timer of the same name, groups them by type and gives
@@ -15,10 +15,12 @@
 //   active  → countdown, Pause / Stop / Finish
 //   paused  → remaining time (editable), Start (resume) / Stop / Finish
 //
-// Manage (allow_create / allow_delete, admins only): a collapsible section under the title
+// Manage (allow_create / allow_edit / allow_delete, admins only): a collapsible section under the title
 // creates helpers over the WebSocket API (timer/create, input_boolean/create — named
 // <prefix><group word>_<name>, labelled in label mode) and deletes storage helpers
-// (timer/delete, input_boolean/delete by their registry unique_id). YAML helpers are locked.
+// (timer/delete, input_boolean/delete by their registry unique_id). Edit loads */list and saves
+// */update (full replacement), renaming the pair's entity IDs together via the entity registry.
+// YAML helpers are locked.
 //
 // Groups can be reordered (group_order), hidden (hidden_types) and made collapsible
 // (collapsible_groups, with collapsed_groups starting collapsed). group_by: area groups by
@@ -32,7 +34,7 @@
 // interpolated into it); per-card values are custom properties set inline on the
 // card root. The card renders once and patches itself on every state change.
 
-const BUILD_NUMBER = 'v2026.10.15.35';
+const BUILD_NUMBER = 'v2026.10.15.36';
 const VERSION = BUILD_NUMBER.slice(1);
 const CARD_TAG = 'bypass-manager-card';
 const EDITOR_TAG = 'bypass-manager-card-editor';
@@ -393,6 +395,7 @@ const DEFAULTS = {
   collapsible_groups: false,
   allow_create: false,
   allow_delete: false,
+  allow_edit: false,
   show_unpaired: false,
   increment_step: 1,
   increment_unit: 'minutes',
@@ -529,16 +532,17 @@ function fmtClock(iso, now = Date.now()) {
 }
 
 // Typed duration → seconds: 30 / 30m, 90s, 1h, 1h30m, 2m30s
+// Also any h / m / s mix ("1h 05m 30s", which is how the card shows times) and H:MM[:SS].
 function parseInput(raw) {
-  raw = String(raw || '').trim();
-  let m;
-  if ((m = raw.match(/^(\d+)h\s*(\d+)m$/i))) return +m[1] * 3600 + +m[2] * 60;
-  if ((m = raw.match(/^(\d+)h$/i))) return +m[1] * 3600;
-  if ((m = raw.match(/^(\d+)m\s*(\d+)s$/i))) return +m[1] * 60 + +m[2];
-  if ((m = raw.match(/^(\d+)m$/i))) return +m[1] * 60;
-  if ((m = raw.match(/^(\d+)s$/i))) return +m[1];
-  if ((m = raw.match(/^(\d+)$/))) return +m[1] * 60;
-  return 0;
+  raw = String(raw || '').trim().toLowerCase();
+  if (/^\d+$/.test(raw)) return +raw * 60;
+  if (/^\d+:\d{1,2}(:\d{1,2})?$/.test(raw)) {
+    const p = raw.split(':').map(Number);
+    return p[0] * 3600 + p[1] * 60 + (p[2] || 0);
+  }
+  const m = raw.match(/^(?:(\d+)\s*h)?\s*(?:(\d+)\s*m)?\s*(?:(\d+)\s*s)?$/);
+  if (!m || (!m[1] && !m[2] && !m[3])) return 0;
+  return (+m[1] || 0) * 3600 + (+m[2] || 0) * 60 + (+m[3] || 0);
 }
 
 const cssEsc = (s) => (typeof CSS !== 'undefined' && CSS.escape ? CSS.escape(s) : String(s).replace(/["\\]/g, '\\$&'));
@@ -666,6 +670,16 @@ const CARD_CSS = `
   .unp-sub .unp-id { font-size: 11px; color: var(--primary-color); }
   .unp-why { font-style: italic; }
   .unp-hint code { font-family: var(--code-font-family, monospace); }
+  .col-del { gap: 8px; }
+  .edit-btn:hover { color: var(--primary-color); }
+  .row-edit { grid-column: 1 / -1; margin: 2px 16px 8px; padding: 8px 10px; border: 1px solid var(--primary-color); border-radius: 10px;
+    display: flex; flex-direction: column; gap: 6px; font-size: 12px; color: var(--primary-text-color); }
+  .row-edit .mg-form { gap: 6px; }
+  .ed-kind { display: inline-flex; align-items: center; gap: 4px; min-width: 64px; color: var(--secondary-text-color); font-weight: 600; }
+  .ed-kind ha-icon { --mdc-icon-size: 16px; width: 16px; height: 16px; }
+  .ed-id { flex: 1 1 200px; font-family: var(--code-font-family, monospace); }
+  .ed-icon { width: 130px; }
+  .ed-btns { display: flex; gap: 6px; }
   .row-confirm .muted { color: var(--secondary-text-color); font-size: 11px; }
 `;
 
@@ -684,8 +698,8 @@ function rootStyleVars(c, cols) {
   ].join(';');
 }
 
-/** Which columns the card shows, in order. `del` = the card's Delete chip is on. */
-function columns(c, del = false) {
+/** Which columns the card shows, in order. `act` = the card's Edit or Delete chip is on. */
+function columns(c, act = false) {
   const btns = BTN_KEYS.some((k) => cfg(c, k));
   return [
     cfg(c, 'show_icon') && ['icon', 'max-content'],
@@ -694,7 +708,7 @@ function columns(c, del = false) {
     (cfg(c, 'show_timer_input') || cfg(c, 'show_countdown')) && ['time', 'max-content'],
     cfg(c, 'show_duration') && ['dur', 'max-content'],
     cfg(c, 'show_toggle') && ['toggle', 'max-content'],
-    del && ['del', 'max-content'],
+    act && ['act', 'max-content'],
   ].filter(Boolean);
 }
 
@@ -721,7 +735,7 @@ class BypassManagerCard extends HTMLElement {
     // The Manage section (create / delete). Lives here so a redraw never loses it. Starts collapsed.
     this._unpOpen = false;  // the Unpaired section starts collapsed
     this._unpSig = '';
-    this._mg = { open: false, create: null, del: false, group: '', area: '', name: '', dur: '5m', restore: false, busy: false, msg: null, confirm: null };
+    this._mg = { open: false, create: null, del: false, editMode: false, edit: null, group: '', area: '', name: '', dur: '5m', restore: false, busy: false, msg: null, confirm: null };
     this.attachShadow({ mode: 'open' });
   }
 
@@ -731,6 +745,7 @@ class BypassManagerCard extends HTMLElement {
     this._groupOpen = {}; // a changed start setting shows straight away in the editor preview
     if (!this._c('allow_create')) this._mg.create = null;
     if (!this._c('allow_delete')) { this._mg.del = false; this._mg.confirm = null; }
+    if (!this._c('allow_edit')) { this._mg.editMode = false; this._mg.edit = null; }
     if (this._hass) this._render();
   }
 
@@ -775,10 +790,12 @@ class BypassManagerCard extends HTMLElement {
   /** Admins only (the create / delete commands are admin-only in Home Assistant), and only when switched on. */
   _canManage() {
     const h = this._hass;
-    return !!(h && h.user && h.user.is_admin && typeof h.callWS === 'function') && !!(this._c('allow_create') || this._c('allow_delete'));
+    return !!(h && h.user && h.user.is_admin && typeof h.callWS === 'function') && !!(this._c('allow_create') || this._c('allow_delete') || this._c('allow_edit'));
   }
 
   _delMode() { return this._canManage() && this._c('allow_delete') && this._mg.del; }
+
+  _editMode() { return this._canManage() && this._c('allow_edit') && this._mg.editMode; }
 
   _collapsible() { return !!(this._c('collapsible_groups') && this._c('group_rows')); }
 
@@ -805,7 +822,7 @@ class BypassManagerCard extends HTMLElement {
     this._sig = this._signature();
     this._unpaired = this._c('show_unpaired') ? findUnpaired(this._hass, c) : [];
     this._unpSig = this._unpairedSig(this._unpaired);
-    const cols = columns(c, this._delMode());
+    const cols = columns(c, this._delMode() || this._editMode());
     const title = this._c('title');
     const sec = this._c('secondary_info_text');
     const collapsible = this._collapsible();
@@ -868,6 +885,7 @@ class BypassManagerCard extends HTMLElement {
     const m = this._mg;
     const canAdd = this._c('allow_create');
     const canDel = this._c('allow_delete');
+    const canEdit = this._c('allow_edit');
     const chip = (attr, val, on, icon, label, extra = '') => `<button class="chip${extra}${on ? ' on' : ''}" ${attr}="${val}" aria-pressed="${on}"><ha-icon icon="${icon}"></ha-icon>${label}</button>`;
     let form = '';
     if (canAdd && m.create) {
@@ -894,8 +912,9 @@ class BypassManagerCard extends HTMLElement {
             chip('data-mg-create', 'timer', m.create === 'timer', 'mdi:timer-plus-outline', 'Timer'),
             chip('data-mg-create', 'switch', m.create === 'switch', 'mdi:toggle-switch-outline', 'Switch'),
             chip('data-mg-create', 'set', m.create === 'set', 'mdi:link-variant-plus', 'Matched set'),
-          ].join('') : ''}${canDel ? chip('data-mg-del', '1', m.del, 'mdi:trash-can-outline', 'Delete', ' chip-del') : ''}</div>
-          ${form}${delHint}${msg}
+          ].join('') : ''}${canEdit ? chip('data-mg-edit', '1', m.editMode, 'mdi:pencil-outline', 'Edit') : ''}${
+  canDel ? chip('data-mg-del', '1', m.del, 'mdi:trash-can-outline', 'Delete', ' chip-del') : ''}</div>
+          ${form}${canEdit && m.editMode ? '<div class="mg-preview">Tap <ha-icon icon="mdi:pencil-outline" style="--mdc-icon-size:14px"></ha-icon> on a row to edit its switch and timer: name, icon, startup state, timer length, and the entity ID (renamed together, so they stay paired).</div>' : ''}${delHint}${msg}
         </div>` : ''}
       </div>`;
   }
@@ -988,6 +1007,140 @@ class BypassManagerCard extends HTMLElement {
     return entityId.split('.')[1];
   }
 
+  // ── Edit (allow_edit) ───────────────────────────────────────────────────
+  /** Open the edit form for a row: load each helper's stored settings (name, icon, startup / length). */
+  async _openEdit(row) {
+    const m = this._mg;
+    const key = row.bool || row.timer;
+    if (m.edit && m.edit.key === key) { m.edit = null; this._render(); return; }
+    const objectId = key.split('.')[1];
+    const ed = { key, loading: true, busy: false, err: null, items: {}, objectId, orig: objectId,
+      locked: [row.bool && !isEditable(this._hass, row.bool) && row.bool, row.timer && !isEditable(this._hass, row.timer) && row.timer].filter(Boolean) };
+    m.edit = ed; m.confirm = null; m.msg = null;
+    this._render();
+    try {
+      for (const [domain, id] of [['input_boolean', row.bool], ['timer', row.timer]]) {
+        if (!id || !isEditable(this._hass, id)) continue;
+        const uid = await this._storageId(id);
+        const item = ((await this._hass.callWS({ type: `${domain}/list` })) || []).find((x) => x.id === uid);
+        if (!item) { ed.err = `couldn't find ${id} in Home Assistant's helpers`; continue; }
+        ed.items[domain] = domain === 'timer'
+          ? { itemId: uid, entityId: id, name: item.name || '', icon: item.icon || '',
+            dur: (() => { const sec = durationToSecs(item.duration); return sec ? fmtDuration(sec) : '0s'; })(), restore: !!item.restore }
+          : { itemId: uid, entityId: id, name: item.name || '', icon: item.icon || '',
+            initial: item.initial === true ? 'on' : item.initial === false ? 'off' : '' };
+      }
+    } catch (e) { ed.err = errText(e); }
+    ed.loading = false;
+    if (m.edit === ed) this._render();
+  }
+
+  _editHtml(row, secAttr, hid) {
+    const ed = this._mg.edit;
+    const kind = (icon, label) => `<span class="ed-kind"><ha-icon icon="${icon}"></ha-icon>${label}</span>`;
+    const f = (domain, field, cls, ph, title) => `<input type="text" class="${cls}" data-mg="ed:${domain}:${field}" value="${esc(ed.items[domain][field])}" placeholder="${esc(ph)}" title="${esc(title)}">`;
+    let body;
+    if (ed.loading) body = '<div class="mg-preview">Loading…</div>';
+    else {
+      const sw = ed.items.input_boolean;
+      const tm = ed.items.timer;
+      body = `<div class="mg-form">${kind('mdi:identifier', 'ID')}<input type="text" class="ed-id" data-mg="ed:id" value="${esc(ed.objectId)}"
+          title="Entity ID, without input_boolean. / timer. Renames ${sw && tm ? 'both, so they stay paired' : 'it'}."></div>
+        ${sw ? `<div class="mg-form">${kind('mdi:toggle-switch-outline', 'Switch')}${f('input_boolean', 'name', 'mg-name', 'Name', 'Name')}${
+          f('input_boolean', 'icon', 'ed-icon', 'mdi:icon (optional)', 'Icon')}
+          <select data-mg="ed:input_boolean:initial" title="State after Home Assistant starts">${[['', 'At startup: last state'], ['on', 'At startup: on'], ['off', 'At startup: off']]
+    .map(([v, n]) => `<option value="${v}"${v === sw.initial ? ' selected' : ''}>${n}</option>`).join('')}</select></div>` : ''}
+        ${tm ? `<div class="mg-form">${kind('mdi:timer-outline', 'Timer')}${f('timer', 'name', 'mg-name', 'Name', 'Name')}${
+          f('timer', 'icon', 'ed-icon', 'mdi:icon (optional)', 'Icon')}${f('timer', 'dur', 'mg-dur', '5m', 'Timer length: 30m, 1h, 1h30m, 90s')}
+          <label class="mg-check" title="Pick up where it left off after Home Assistant restarts"><input type="checkbox" data-mg="ed:timer:restore"${tm.restore ? ' checked' : ''}>Restore</label></div>` : ''}
+        <div class="mg-preview" data-ed-preview></div>
+        <div class="ed-btns"><button class="btn btn-start" data-ed-save${ed.busy ? ' disabled' : ''}>Save</button><button class="btn btn-cancel" data-ed-cancel>Cancel</button></div>`;
+    }
+    return `<div class="row-edit${hid}"${secAttr}>
+        <div>Edit <b>${esc(row.label)}</b></div>${body}${ed.err ? `<div class="mg-msg err">${esc(ed.err)}</div>` : ''}</div>`;
+  }
+
+  _editField(el) {
+    const ed = this._mg.edit;
+    if (!ed) return;
+    const [, domain, field] = el.dataset.mg.split(':');
+    if (domain === 'id') ed.objectId = el.value;
+    else if (ed.items[domain]) ed.items[domain][field] = el.type === 'checkbox' ? el.checked : el.value;
+    this._editPreview();
+  }
+
+  /** Is the edit form saveable? → { ok, lines[] } (lines: [kind, html]). */
+  _editCheck() {
+    const ed = this._mg.edit;
+    const lines = [];
+    const items = Object.entries(ed.items);
+    if (!items.length) return { ok: false, lines };
+    let ok = true;
+    for (const [domain, it] of items) {
+      if (!String(it.name).trim()) { ok = false; lines.push(['bad', `The ${domain === 'timer' ? 'timer' : 'switch'} needs a name.`]); }
+      if (domain === 'timer' && !parseInput(it.dur)) { ok = false; lines.push(['bad', 'Timer length: try 30m, 1h or 1h30m.']); }
+    }
+    const newId = slugify(ed.objectId);
+    if (!newId) { ok = false; lines.push(['bad', 'The ID can\'t be empty.']); } else if (newId !== ed.orig) {
+      if (ed.locked.length) { ok = false; lines.push(['bad', `${ed.locked.map(esc).join(' and ')} is set up in YAML, so the pair can't be renamed here.`]); }
+      const renames = items.map(([domain, it]) => [it.entityId, `${domain}.${newId}`]);
+      for (const [, to] of renames) if (this._hass.states[to]) { ok = false; lines.push(['bad', `<code>${esc(to)}</code> already exists.`]); }
+      lines.push(['', `Renames ${renames.map(([a, b]) => `<code>${esc(a)}</code> → <code>${esc(b)}</code>`).join(', ')}`]);
+      if (items.length === 1) {
+        const other = `${items[0][0] === 'timer' ? 'input_boolean' : 'timer'}.${newId}`;
+        if (this._hass.states[other]) lines.push(['', `and pairs it with <code>${esc(other)}</code>.`]);
+      }
+      const prefix = this._config.entity_prefix || 'bypass_';
+      if (this._config.discovery_mode !== 'label' && !newId.startsWith(prefix)) lines.push(['warn', `Doesn't start with "${esc(prefix)}", so the card won't find it.`]);
+      if (newId !== ed.objectId.trim()) lines.push(['', `(as <code>${esc(newId)}</code>)`]);
+    }
+    return { ok, lines };
+  }
+
+  _editPreview() {
+    const box = this.shadowRoot.querySelector('[data-ed-preview]');
+    const save = this.shadowRoot.querySelector('[data-ed-save]');
+    if (!box) return;
+    const { ok, lines } = this._editCheck();
+    if (save) save.disabled = !ok || this._mg.edit.busy;
+    box.innerHTML = lines.map(([k, h]) => (k ? `<span class="${k}">${h}</span>` : h)).join('<br>');
+  }
+
+  async _saveEdit() {
+    const m = this._mg;
+    const ed = m.edit;
+    if (!ed || ed.busy || !this._editCheck().ok) return;
+    ed.busy = true; ed.err = null;
+    this._render();
+    const errs = []; const done = [];
+    for (const [domain, it] of Object.entries(ed.items)) {
+      // Home Assistant replaces the whole helper on update, so send every field (no icon = no icon).
+      const data = { type: `${domain}/update`, [`${domain}_id`]: it.itemId, name: String(it.name).trim() };
+      const icon = String(it.icon).trim();
+      if (icon) data.icon = icon.includes(':') ? icon : `mdi:${icon}`;
+      if (domain === 'timer') { data.duration = secsToHMS(parseInput(it.dur)); data.restore = !!it.restore; }
+      else if (it.initial) data.initial = it.initial === 'on';
+      try { await this._hass.callWS(data); done.push(it.entityId); } catch (e) { errs.push(`${it.entityId}: ${errText(e)}`); }
+    }
+    const newId = slugify(ed.objectId);
+    const renamed = [];
+    if (!errs.length && newId !== ed.orig) {
+      for (const [domain, it] of Object.entries(ed.items)) {
+        const to = `${domain}.${newId}`;
+        try {
+          await this._hass.callWS({ type: 'config/entity_registry/update', entity_id: it.entityId, new_entity_id: to });
+          renamed.push(to);
+          if (domain === 'timer') { delete this._inputSecs[it.entityId]; delete this._finishTimes[it.entityId]; delete this._pausedSecs[it.entityId]; }
+        } catch (e) { errs.push(`rename ${it.entityId}: ${errText(e)}`); }
+      }
+    }
+    ed.busy = false;
+    if (errs.length) { ed.err = `Couldn't save ${errs.join('; ')}`; if (m.edit === ed) this._render(); return; }
+    m.edit = null;
+    m.msg = { kind: 'ok', text: `Saved ${done.join(' + ')}${renamed.length ? `, now ${renamed.join(' + ')}` : ''}.` };
+    this._render();
+  }
+
   async _delete(row, what) {
     const m = this._mg;
     const targets = [];
@@ -1031,6 +1184,8 @@ class BypassManagerCard extends HTMLElement {
     const t = row.timer;
     const key = row.bool || row.timer;
     const canDel = (row.timer && isEditable(this._hass, row.timer)) || (row.bool && isEditable(this._hass, row.bool));
+    const delOn = this._delMode() && canDel;
+    const editOn = this._editMode() && canDel;
     const secAttr = section && this._collapsible() ? ` data-sec="${esc(section)}"` : '';
     const hid = hidden ? ' sec-hidden' : '';
     const cell = {
@@ -1051,9 +1206,10 @@ class BypassManagerCard extends HTMLElement {
       dur: () => `<span class="col-dur"${t ? ` data-dur="${esc(t)}" data-more="${esc(t)}" title="Timer duration"` : ''}></span>`,
       toggle: () => `<span class="col-toggle">${row.bool ? `<ha-switch data-bool="${esc(row.bool)}"></ha-switch>`
         : (this._c('show_timer_badge') ? '<span class="solo-timer-badge">timer only</span>' : '')}</span>`,
-      del: () => `<span class="col-del">${canDel
-        ? `<button class="del-btn" data-del="${esc(key)}" title="Delete…"><ha-icon icon="mdi:trash-can-outline"></ha-icon></button>`
-        : '<span class="del-na" title="Set up in YAML: can\'t be deleted here"><ha-icon icon="mdi:lock-outline"></ha-icon></span>'}</span>`,
+      act: () => `<span class="col-del">${canDel ? `${
+        editOn ? `<button class="del-btn edit-btn" data-edit="${esc(key)}" title="Edit…"><ha-icon icon="mdi:pencil-outline"></ha-icon></button>` : ''}${
+        delOn ? `<button class="del-btn" data-del="${esc(key)}" title="Delete…"><ha-icon icon="mdi:trash-can-outline"></ha-icon></button>` : ''}`
+    : '<span class="del-na" title="Set up in YAML: can\'t be edited or deleted here"><ha-icon icon="mdi:lock-outline"></ha-icon></span>'}</span>`,
     };
     const html = cols.map(([k], i) => {
       let h = cell[k]();
@@ -1066,7 +1222,8 @@ class BypassManagerCard extends HTMLElement {
       row.bool ? `<span>Switch: <span data-lc="${esc(row.bool)}">—</span>${clock ? ` <span class="lc-clock" data-lc-clock="${esc(row.bool)}"></span>` : ''}</span>` : ''}${
       t ? `<span>Timer: <span data-lc="${esc(t)}">—</span>${clock ? ` <span class="lc-clock" data-lc-clock="${esc(t)}"></span>` : ''}</span>` : ''}</div>` : '';
     const confirm = this._delMode() && this._mg.confirm === key && canDel ? this._confirmHtml(row, secAttr, hid) : '';
-    return `<div class="row${row.bool ? '' : ' solo-timer'}${hid}" data-row="${esc(key)}"${secAttr}>${html}</div>${lc}${confirm}`;
+    const edit = this._editMode() && this._mg.edit && this._mg.edit.key === key ? this._editHtml(row, secAttr, hid) : '';
+    return `<div class="row${row.bool ? '' : ' solo-timer'}${hid}" data-row="${esc(key)}"${secAttr}>${html}</div>${lc}${edit}${confirm}`;
   }
 
   _wire() {
@@ -1094,6 +1251,15 @@ class BypassManagerCard extends HTMLElement {
     on('[data-mg="area"]', 'change', (el) => { m.area = el.value; this._mgPreview(); });
     on('[data-mg="restore"]', 'change', (el) => { m.restore = el.checked; });
     on('[data-mg-go]', 'click', () => this._create());
+    on('[data-mg-edit]', 'click', () => { m.editMode = !m.editMode; m.edit = null; m.msg = null; this._render(); });
+    on('[data-edit]', 'click', (el) => {
+      const row = this._allRows().find((r) => (r.bool || r.timer) === el.dataset.edit);
+      if (row) this._openEdit(row);
+    });
+    on('[data-mg^="ed:"]', 'input', (el) => this._editField(el));
+    on('[data-mg^="ed:"]', 'change', (el) => this._editField(el));
+    on('[data-ed-save]', 'click', () => this._saveEdit());
+    on('[data-ed-cancel]', 'click', () => { m.edit = null; this._render(); });
     on('[data-del]', 'click', (el) => { m.confirm = m.confirm === el.dataset.del ? null : el.dataset.del; this._render(); });
     on('[data-del-cancel]', 'click', () => { m.confirm = null; this._render(); });
     on('[data-del-do]', 'click', (el) => {
@@ -1101,6 +1267,7 @@ class BypassManagerCard extends HTMLElement {
       if (row) this._delete(row, el.dataset.delDo);
     });
     this._mgPreview();
+    this._editPreview();
     root.querySelectorAll('ha-switch[data-bool]').forEach((sw) => sw.addEventListener('change', () => this._toggleBool(sw.dataset.bool)));
     root.querySelectorAll('[data-icon-tap]').forEach((b) => b.addEventListener('click', (e) => {
       e.stopPropagation();
@@ -1484,7 +1651,7 @@ const EDITOR_CSS = `
 // Settings that show or hide other settings: changing one re-renders the editor.
 const REVEAL_KEYS = new Set(['discovery_mode', 'group_rows', 'show_group_labels', 'show_dividers', 'show_icon', 'show_entity_names',
   'show_toggle', 'show_timer_input', 'show_countdown', 'show_last_changed', 'show_active_count', 'secondary_info_text',
-  'collapsible_groups', 'allow_create', 'allow_delete', 'show_unpaired', ...BTN_KEYS]);
+  'collapsible_groups', 'allow_create', 'allow_delete', 'allow_edit', 'show_unpaired', ...BTN_KEYS]);
 
 class BypassManagerCardEditor extends HTMLElement {
   constructor() {
@@ -1717,14 +1884,17 @@ class BypassManagerCardEditor extends HTMLElement {
   _manageBody() {
     const label = this._c('discovery_mode') === 'label';
     const prefix = this._config.entity_prefix || 'bypass_';
-    return `<p class="bmce-hint">Create and delete bypass helpers right on the card. A <b>Manage</b> section appears under the title, collapsed,
+    return `<p class="bmce-hint">Create, edit and delete bypass switches (<code>input_boolean</code>) and timers right on the card. A <b>Manage</b> section appears under the title, collapsed,
         with a chip for each. Only admin users see it.</p>
       ${this._check('allow_create', 'Create', '(Timer, Switch, or a Matched set of both)')}
+      ${this._check('allow_edit', 'Edit', '(a pencil on each row: name, icon, startup state, timer length, entity ID)')}
       ${this._check('allow_delete', 'Delete', '(a trash button on each row; asks first)')}
       ${this._c('allow_create') ? `<p class="bmce-hint">New helpers follow the card's naming: prefix + group word + name, so group <b>Door</b> + "Patio" is
         <code>${esc(slugify(`${prefix}door_patio`))}</code>. A name that already has a group word keeps it ("Office light" → <code>${esc(slugify(`${prefix}office_light`))}</code>).${
   label ? ` New helpers also get the "${esc(this._config.discovery_label || 'bypass')}" label so the card finds them.` : ''}</p>` : ''}
-      ${this._c('allow_delete') ? '<p class="bmce-hint">Deleting is permanent. Helpers set up in YAML show a lock and can\'t be deleted here.</p>' : ''}`;
+      ${this._c('allow_edit') ? '<p class="bmce-hint">Changing the ID renames the switch and timer together, so they stay paired. It\'s also how you pair an unpaired helper: give it its partner\'s ID.</p>' : ''}
+      ${this._c('allow_delete') ? '<p class="bmce-hint">Deleting is permanent.</p>' : ''}
+      ${this._c('allow_edit') || this._c('allow_delete') ? '<p class="bmce-hint">Helpers set up in YAML show a lock and can\'t be changed here.</p>' : ''}`;
   }
 
   _lookBody() {

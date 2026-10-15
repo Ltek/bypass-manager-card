@@ -2,7 +2,7 @@
 
 [![Add to HACS](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=Ltek&repository=bypass-manager-card&category=plugin)
 
-Current build: **v2026.10.15.35** · full history in [CHANGELOG.md](CHANGELOG.md)
+Current build: **v2026.10.15.36** · full history in [CHANGELOG.md](CHANGELOG.md)
 
 A Home Assistant Dashboard card for **all** your bypass helpers: security zones, doors, windows,
 motion, lights, scenes, locks, weather and anything else. It finds every bypass `input_boolean`
@@ -23,7 +23,7 @@ timer control. There's a visual editor for every setting.
   Stop / Finish (each separately), set time with − / + steps, live countdown, timer duration, on/off switch.
 - **Last changed** line per row, with the clock time if you want it.
 - **Title line** with an active count ("3 active" / "All off") and an optional glow while anything is on.
-- **Create and delete helpers** from the card (admins only): a Timer, a Switch, or a matched set of both,
+- **Create, edit and delete helpers** from the card (admins only): a Timer, a Switch, or a matched set of both,
   named the card's way (`bypass_door_patio`), in an area when grouping by area. YAML helpers are locked.
 - **Unpaired list** (optional): every switch without a timer and timer without a switch, with a
   *possible match* when another helper's name looks like it belongs.
@@ -101,19 +101,22 @@ your prefix count too. The section hides when everything is paired.
 
 ## Create & delete
 
-Turn on `allow_create` and / or `allow_delete`. A **Manage** section appears under the title, collapsed.
+Turn on `allow_create`, `allow_edit` and / or `allow_delete`. A **Manage** section appears under the title, collapsed.
 Only admin users see it, because Home Assistant only lets admins create or delete helpers.
 
 - **Timer / Switch / Matched set**: choose a group, type a name (and a timer length). The card builds the
   name the way it reads names: prefix + group word + name, so **Door** + "Patio" is `bypass_door_patio`.
   A name that already has a group word keeps it ("Office light" → `bypass_office_light`). The preview shows
   the entity IDs and the group before you create. In label mode the new helper also gets the label.
+- **Edit**: puts a pencil on every row. Change the switch's name, icon and startup state, the timer's
+  name, icon, length and restore setting, or the entity ID, which renames the switch and timer together
+  so they stay paired (and pairs an unpaired helper when you give it its partner's ID).
 - **Delete**: puts a trash button on every row. Tap it, then choose Timer, Switch or Both. Deleting is
   permanent. Helpers set up in YAML show a lock instead.
 
 ## Set time
 
-The time field takes `30` (minutes), `30m`, `90s`, `1h`, `1h30m` or `2m30s`. − / + change it by the
+The time field takes `30` (minutes), `30m`, `90s`, `1h`, `1h30m`, `1h 05m 30s` or `1:30` (H:MM). − / + change it by the
 step you set (`increment_step` + `increment_unit`). Start uses that time; Start on a paused timer resumes it.
 
 ## Options
@@ -135,6 +138,7 @@ Every option is in the visual editor. Leave an option out to get its default.
 | `collapsed_groups` | none | Groups that start collapsed |
 | `show_unpaired` | `false` | Collapsible list of unpaired switches / timers, with possible matches |
 | `allow_create` | `false` | Manage section: create a Timer, Switch or Matched set (admins only) |
+| `allow_edit` | `false` | Manage section: edit a row's switch and timer, including renaming the pair (admins only) |
 | `allow_delete` | `false` | Manage section: delete helpers from their row (admins only) |
 | `sort` | `name` | `name`, or `active` (active first, newest change first) |
 | `show_group_labels` | `true` | Group titles |
