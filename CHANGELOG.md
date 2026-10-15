@@ -1,5 +1,27 @@
 # Changelog
 
+## v2026.10.15.33
+
+**New**
+- **Create helpers from the card** (`allow_create`). A **Manage** section under the title (starts collapsed) has
+  chips for **Timer**, **Switch** and **Matched set** (both). Pick a group, type a name and a timer length;
+  the card names it the way it reads names: group **Door** + "Patio" → `bypass_door_patio`. A name that
+  already has a group word keeps it ("Office light" → `bypass_office_light`). A live preview shows the entity
+  IDs, the group it lands in, any existing switch or timer it pairs with, and blocks names already in use.
+  In label mode the new helper also gets the label.
+- **Delete helpers from the card** (`allow_delete`). The **Delete** chip puts a trash button on each row; tap it
+  and choose Timer, Switch or Both. Helpers set up in YAML show a lock instead.
+- Both are off by default and only appear for admin users (Home Assistant only lets admins create or delete helpers).
+- **Collapsible groups** (`collapsible_groups`): tap a group title to fold it. A folded group still shows how
+  many of its bypasses are on. Each group can start open or collapsed (`collapsed_groups`).
+
+**Settings**
+- **Groups & order** is now a list of group rows: ↑ / ↓ set the order (`group_order`), the eye shows or hides
+  the group, and with collapsible groups on, the chevron sets whether it starts open or collapsed.
+  "↺ Default order" puts the order back.
+- New **Create & delete** panel.
+- Renaming a custom group keeps its order, visibility and start state.
+
 ## v2026.10.14.32
 
 Made for **all** bypasses, not just security ones, and brings in everything the old Admin-dashboard

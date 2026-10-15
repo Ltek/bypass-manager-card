@@ -1,5 +1,5 @@
 // Bypass & Timer Manager Card — Home Assistant Dashboard card for bypass switches + timers
-// Version: v2026.10.14.32
+// Version: v2026.10.15.33
 //
 // Finds every bypass input_boolean and timer (by entity-ID prefix or by HA label),
 // pairs each switch with the timer of the same name, groups them by type and gives
@@ -15,11 +15,19 @@
 //   active  → countdown, Pause / Stop / Finish
 //   paused  → remaining time (editable), Start (resume) / Stop / Finish
 //
+// Manage (allow_create / allow_delete, admins only): a collapsible section under the title
+// creates helpers over the WebSocket API (timer/create, input_boolean/create — named
+// <prefix><group word>_<name>, labelled in label mode) and deletes storage helpers
+// (timer/delete, input_boolean/delete by their registry unique_id). YAML helpers are locked.
+//
+// Groups can be reordered (group_order), hidden (hidden_types) and made collapsible
+// (collapsible_groups, with collapsed_groups starting collapsed).
+//
 // Vanilla JS, single file. The card stylesheet is a constant (no config values are
 // interpolated into it); per-card values are custom properties set inline on the
 // card root. The card renders once and patches itself on every state change.
 
-const BUILD_NUMBER = 'v2026.10.14.32';
+const BUILD_NUMBER = 'v2026.10.15.33';
 const VERSION = BUILD_NUMBER.slice(1);
 const CARD_TAG = 'bypass-manager-card';
 const EDITOR_TAG = 'bypass-manager-card-editor';
@@ -53,6 +61,62 @@ function customLabels(customTypes) {
 
 function allGroups(customTypes) {
   return [...GROUP_ORDER, ...customLabels(customTypes)];
+}
+
+/** Every group in the user's order (`group_order`), then any not in it in the default order. */
+function orderedGroups(c) {
+  const all = allGroups(c.custom_types);
+  return [...new Set([...(c.group_order || []).filter((g) => all.includes(g)), ...all])];
+}
+
+function groupIcon(label, customTypes) {
+  const ct = (customTypes || []).find((t) => t && t.label === label);
+  if (ct) return ct.icon || OTHER_ICON;
+  const b = BUILTIN_GROUPS.find((g) => g[0] === label);
+  return b ? b[2] : OTHER_ICON;
+}
+
+/** The word that puts a name in a group (null for Other). */
+function groupKeyword(label, customTypes) {
+  const ct = (customTypes || []).find((t) => t && t.label === label && t.keyword);
+  if (ct) return slugify(ct.keyword) || null;
+  const b = BUILTIN_GROUPS.find((g) => g[0] === label);
+  return b ? b[1] : null;
+}
+
+/** Home Assistant's slugify, close enough for helper names: "Door Patio!" → "door_patio". */
+function slugify(s) {
+  return String(s || '').normalize('NFKD').replace(/[\u0300-\u036f]/g, '').toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+}
+
+/** "bypass_door_patio" → "Bypass Door Patio" (Home Assistant slugifies it straight back). */
+function titleWords(objectId) {
+  return objectId.split('_').filter(Boolean).map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+}
+
+/**
+ * What creating a helper called `name` would make, following the naming the card reads:
+ * <prefix><group word>_<name>. A chosen group adds its word unless the name already has it
+ * (so "office light" stays office_light); "Auto" ('') leaves the name as typed. A typed prefix
+ * is not doubled. → { suffix, objectId, name, lands, warnings[] } or null when there's no name.
+ */
+function planHelperName(c, rawName, group) {
+  const custom = c.custom_types || [];
+  const prefix = c.entity_prefix || 'bypass_';
+  const ps = slugify(prefix);
+  let suffix = slugify(rawName);
+  if (ps && suffix.startsWith(`${ps}_`)) suffix = suffix.slice(ps.length + 1);
+  if (!suffix) return null;
+  const kw = group ? groupKeyword(group, custom) : null;
+  if (kw && keywordPos(suffix, kw, false) < 0) suffix = `${kw}_${suffix}`;
+  const objectId = slugify(`${prefix}${suffix}`);
+  const lands = groupFor(suffix, custom).label;
+  const warnings = [];
+  if (c.discovery_mode !== 'label' && !objectId.startsWith(prefix)) warnings.push(`doesn't start with your prefix "${prefix}", so the card won't find it`);
+  if (group && lands !== group) warnings.push(`its name puts it in ${lands}, not ${group}`);
+  if ((c.hidden_types || []).includes(lands)) warnings.push(`the ${lands} group is hidden`);
+  return { suffix, objectId, name: titleWords(objectId), lands, warnings };
 }
 
 /** Position of a keyword in a name, or -1. Legacy keywords match anywhere; newer ones at a word start. */
@@ -161,7 +225,7 @@ function buildSections(hass, c) {
     ? (a, b) => (rowIsOn(hass, b) - rowIsOn(hass, a)) || (rowChanged(hass, b) - rowChanged(hass, a)) || byName(a, b)
     : byName;
   if (c.group_rows === false) return rows.length ? [{ section: '', rows: rows.sort(sorter) }] : [];
-  return allGroups(custom)
+  return orderedGroups(c)
     .map((g) => ({ section: g, rows: rows.filter((r) => r.group === g).sort(sorter) }))
     .filter((s) => s.rows.length);
 }
@@ -196,6 +260,9 @@ const DEFAULTS = {
   show_active_count: false,
   glow_when_active: false,
   strip_group_word: true,
+  collapsible_groups: false,
+  allow_create: false,
+  allow_delete: false,
   increment_step: 1,
   increment_unit: 'minutes',
   secondary_info_text: '',
@@ -256,7 +323,12 @@ function normalizeConfig(raw) {
   delete c.show_timer_controls;
   for (const k of Object.keys(DEFAULTS)) if (k in c && (c[k] === null || isDefault(k, c[k]))) delete c[k];
   for (const k of COLOR_KEYS) if (k in c && (c[k] === '' || c[k] == null)) delete c[k];
-  for (const k of ['hidden_types', 'custom_types']) if (Array.isArray(c[k]) && !c[k].length) delete c[k];
+  // group_order: kept only while it differs from the default order (stored resolved, so idempotent).
+  if (Array.isArray(c.group_order)) {
+    const o = orderedGroups(c);
+    if (o.join('\n') === allGroups(c.custom_types).join('\n')) delete c.group_order; else c.group_order = o;
+  } else delete c.group_order;
+  for (const k of ['hidden_types', 'custom_types', 'collapsed_groups']) if (Array.isArray(c[k]) && !c[k].length) delete c[k];
   if (Array.isArray(c.strip_words) && c.strip_words.length === 1 && c.strip_words[0] === 'bypass') delete c.strip_words;
   return c;
 }
@@ -404,6 +476,52 @@ const CARD_CSS = `
   ha-switch { --mdc-theme-secondary: var(--bm-c-active); --switch-checked-color: var(--bm-c-active); }
   .row-last-changed { grid-column: 1 / -1; font-size: var(--bm-fs-lc); color: var(--bm-c-lc); padding: 0 16px 6px; display: flex; gap: 16px; flex-wrap: wrap; }
   .lc-clock { opacity: .8; }
+
+  .sec-toggle { display: flex; align-items: center; gap: 4px; width: 100%; border: none; background: none; cursor: pointer; text-align: left;
+    font-family: inherit; }
+  .sec-toggle .sec-chev { --mdc-icon-size: 16px; width: 16px; height: 16px; transition: transform .2s ease; }
+  .sec-toggle.collapsed .sec-chev { transform: rotate(-90deg); }
+  .sec-on { margin-left: 6px; color: var(--bm-c-active); text-transform: none; letter-spacing: 0; }
+  .sec-hidden { display: none !important; }
+
+  .manage { grid-column: 1 / -1; margin: 0 16px 8px; border: 1px solid var(--divider-color); border-radius: 10px; }
+  .manage.open { border-color: var(--primary-color); }
+  .manage-head { display: flex; align-items: center; gap: 6px; width: 100%; border: none; background: none; padding: 6px 10px; cursor: pointer;
+    color: var(--secondary-text-color); font-family: inherit; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .05em; }
+  .manage-head ha-icon { --mdc-icon-size: 16px; width: 16px; height: 16px; }
+  .manage-head .chev { margin-left: auto; transition: transform .2s ease; transform: rotate(-90deg); }
+  .manage.open .manage-head .chev { transform: none; }
+  .manage-body { padding: 0 10px 10px; display: flex; flex-direction: column; gap: 8px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip { height: 28px; padding: 0 12px; border-radius: 14px; border: 1px solid var(--divider-color); background: none; cursor: pointer;
+    color: var(--primary-text-color); font-family: inherit; font-size: 12px; font-weight: 500; display: inline-flex; align-items: center; gap: 4px; }
+  .chip ha-icon { --mdc-icon-size: 16px; width: 16px; height: 16px; }
+  .chip.on { background: var(--primary-color); border-color: var(--primary-color); color: var(--text-primary-color, #fff); }
+  .chip.chip-del.on { background: var(--error-color, #db4437); border-color: var(--error-color, #db4437); color: #fff; }
+  .mg-form { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+  .mg-form input[type="text"], .mg-form select { height: 28px; box-sizing: border-box; padding: 0 8px; border: 1px solid var(--divider-color);
+    border-radius: 6px; background: var(--card-background-color); color: var(--primary-text-color); font-family: inherit; font-size: 12px; }
+  .mg-form input:focus, .mg-form select:focus { outline: none; border-color: var(--primary-color); }
+  .mg-form .mg-name { flex: 1 1 140px; min-width: 0; }
+  .mg-form .mg-dur { width: 72px; text-align: center; }
+  .mg-check { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; color: var(--secondary-text-color); cursor: pointer; }
+  .mg-preview { font-size: 11px; color: var(--secondary-text-color); line-height: 1.5; }
+  .mg-preview code { font-family: var(--code-font-family, monospace); color: var(--primary-text-color); }
+  .mg-preview .warn { color: var(--warning-color, #f4b942); }
+  .mg-preview .bad, .mg-msg.err { color: var(--error-color, #db4437); }
+  .mg-msg { font-size: 12px; }
+  .mg-msg.ok { color: var(--success-color, #43a047); }
+  .btn:disabled { opacity: .4; cursor: default; }
+  .btn-del { background: var(--error-color, #db4437); color: #fff; }
+  .btn-cancel { background: var(--secondary-background-color); color: var(--primary-text-color); }
+  .col-del { display: flex; align-items: center; justify-content: center; }
+  .del-btn { border: none; background: none; padding: 0; margin: 0; cursor: pointer; line-height: 0; color: var(--secondary-text-color); }
+  .del-btn:hover { color: var(--error-color, #db4437); }
+  .del-btn ha-icon, .del-na ha-icon { --mdc-icon-size: 18px; width: 18px; height: 18px; }
+  .del-na { line-height: 0; color: var(--disabled-text-color, var(--secondary-text-color)); opacity: .6; }
+  .row-confirm { grid-column: 1 / -1; display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 2px 16px 8px; font-size: 12px;
+    color: var(--primary-text-color); }
+  .row-confirm .muted { color: var(--secondary-text-color); font-size: 11px; }
 `;
 
 /** The per-card values, as custom properties on the card root (the stylesheet never changes). */
@@ -421,8 +539,8 @@ function rootStyleVars(c, cols) {
   ].join(';');
 }
 
-/** Which columns the card shows, in order. */
-function columns(c) {
+/** Which columns the card shows, in order. `del` = the card's Delete chip is on. */
+function columns(c, del = false) {
   const btns = BTN_KEYS.some((k) => cfg(c, k));
   return [
     cfg(c, 'show_icon') && ['icon', 'max-content'],
@@ -431,8 +549,16 @@ function columns(c) {
     (cfg(c, 'show_timer_input') || cfg(c, 'show_countdown')) && ['time', 'max-content'],
     cfg(c, 'show_duration') && ['dur', 'max-content'],
     cfg(c, 'show_toggle') && ['toggle', 'max-content'],
+    del && ['del', 'max-content'],
   ].filter(Boolean);
 }
+
+/** A storage helper can be deleted from the UI; a YAML one says editable: false. */
+const isEditable = (hass, id) => {
+  const s = id && hass && hass.states[id];
+  return !!s && !(s.attributes && s.attributes.editable === false);
+};
+const errText = (e) => (e && (e.message || e.code)) || String(e);
 
 class BypassManagerCard extends HTMLElement {
   constructor() {
@@ -446,12 +572,18 @@ class BypassManagerCard extends HTMLElement {
     this._inputSecs = {};   // timer → seconds typed / stepped while idle
     this._sections = [];
     this._sig = '';
+    this._groupOpen = {};   // group → open (seeded from collapsed_groups; kept across redraws)
+    // The Manage section (create / delete). Lives here so a redraw never loses it. Starts collapsed.
+    this._mg = { open: false, create: null, del: false, group: '', name: '', dur: '5m', restore: false, busy: false, msg: null, confirm: null };
     this.attachShadow({ mode: 'open' });
   }
 
   setConfig(config) {
     if (!config) throw new Error('Invalid configuration');
     this._config = normalizeConfig(config);
+    this._groupOpen = {}; // a changed start setting shows straight away in the editor preview
+    if (!this._c('allow_create')) this._mg.create = null;
+    if (!this._c('allow_delete')) { this._mg.del = false; this._mg.confirm = null; }
     if (this._hass) this._render();
   }
 
@@ -493,6 +625,21 @@ class BypassManagerCard extends HTMLElement {
 
   _allTimers() { return this._allRows().map((r) => r.timer).filter(Boolean); }
 
+  /** Admins only (the create / delete commands are admin-only in Home Assistant), and only when switched on. */
+  _canManage() {
+    const h = this._hass;
+    return !!(h && h.user && h.user.is_admin && typeof h.callWS === 'function') && !!(this._c('allow_create') || this._c('allow_delete'));
+  }
+
+  _delMode() { return this._canManage() && this._c('allow_delete') && this._mg.del; }
+
+  _collapsible() { return !!(this._c('collapsible_groups') && this._c('group_rows')); }
+
+  _isOpen(group) {
+    if (!(group in this._groupOpen)) this._groupOpen[group] = !(this._config.collapsed_groups || []).includes(group);
+    return this._groupOpen[group];
+  }
+
   /** What, if it changes, needs the rows rebuilt (not just patched): which entities exist and their order. */
   _signature() {
     return this._sections.map((s) => `${s.section}:${s.rows.map((r) => `${r.bool || ''}|${r.timer || ''}`).join(',')}`).join(';');
@@ -502,33 +649,208 @@ class BypassManagerCard extends HTMLElement {
   _render() {
     if (!this._hass) return;
     const c = this._config;
+    // Keep the caret in a Manage field across the redraw (a new helper appearing redraws the rows).
+    const ae = this.shadowRoot.activeElement;
+    const focusKey = ae && ae.dataset && ae.dataset.mg;
+    let caret = null;
+    try { caret = focusKey && ae.selectionStart != null ? [ae.selectionStart, ae.selectionEnd] : null; } catch (e) { caret = null; }
     this._sections = buildSections(this._hass, c);
     this._sig = this._signature();
-    const cols = columns(c);
+    const cols = columns(c, this._delMode());
     const title = this._c('title');
     const sec = this._c('secondary_info_text');
-    const showGroups = this._c('show_group_labels') && this._c('group_rows');
+    const collapsible = this._collapsible();
+    const showGroups = (this._c('show_group_labels') || collapsible) && this._c('group_rows');
+    const groupHead = (g) => {
+      if (!collapsible) return `<div class="section-label">${esc(g)}</div>`;
+      const open = this._isOpen(g);
+      return `<button class="section-label sec-toggle${open ? '' : ' collapsed'}" data-sec-toggle="${esc(g)}" aria-expanded="${open}">`
+        + `<ha-icon class="sec-chev" icon="mdi:chevron-down"></ha-icon><span>${esc(g)}</span><span class="sec-on" data-sec-on="${esc(g)}"></span></button>`;
+    };
     const body = this._sections.length
       ? this._sections.map((s, i) => `${i > 0 && this._c('show_dividers') && this._c('group_rows') ? '<div class="divider"></div>' : ''}${
-        showGroups && s.section ? `<div class="section-label">${esc(s.section)}</div>` : ''}${s.rows.map((r) => this._rowHtml(r, cols)).join('')}`).join('')
+        showGroups && s.section ? groupHead(s.section) : ''}${s.rows.map((r) => this._rowHtml(r, cols, !!(collapsible && s.section && !this._isOpen(s.section)), s.section)).join('')}`).join('')
       : '<div class="empty">No bypass switches or timers found.</div>';
     this.shadowRoot.innerHTML = `<style>${CARD_CSS}</style>
       <ha-card class="card" style="${esc(rootStyleVars(c, cols.map((x) => x[1]).join(' ') || '1fr'))}">
         ${title || this._c('show_active_count') ? `<div class="head"><span class="card-title">${esc(title)}</span>${
           this._c('show_active_count') ? '<span class="count" data-count></span>' : ''}</div>` : ''}
         ${sec ? `<div class="card-secondary">${esc(sec)}</div>` : ''}
+        ${this._canManage() ? this._manageHtml() : ''}
         ${body}
       </ha-card>`;
     this._wire();
     this._syncTimerTimes();
     this._patch();
     this._tick();
+    if (focusKey) {
+      const el = this.shadowRoot.querySelector(`[data-mg="${cssEsc(focusKey)}"]`);
+      if (el) { el.focus(); if (caret) try { el.setSelectionRange(caret[0], caret[1]); } catch (e) { /* not a text field */ } }
+    }
   }
 
-  _rowHtml(row, cols) {
+  // ── Manage section (create / delete helpers) ────────────────────────────
+  _manageHtml() {
+    const m = this._mg;
+    const canAdd = this._c('allow_create');
+    const canDel = this._c('allow_delete');
+    const chip = (attr, val, on, icon, label, extra = '') => `<button class="chip${extra}${on ? ' on' : ''}" ${attr}="${val}" aria-pressed="${on}"><ha-icon icon="${icon}"></ha-icon>${label}</button>`;
+    let form = '';
+    if (canAdd && m.create) {
+      const groups = orderedGroups(this._config);
+      form = `<div class="mg-form">
+          <select data-mg="group" title="Group: adds its word to the name"><option value="">Group: auto</option>${
+            groups.map((g) => `<option value="${esc(g)}"${g === m.group ? ' selected' : ''}>${esc(g)}</option>`).join('')}</select>
+          <input type="text" class="mg-name" data-mg="name" placeholder="Name, e.g. Patio" value="${esc(m.name)}">
+          ${m.create !== 'switch' ? `<input type="text" class="mg-dur" data-mg="dur" title="Timer length: 30m, 1h, 1h30m, 90s" value="${esc(m.dur)}">
+          <label class="mg-check" title="Pick up where it left off after Home Assistant restarts"><input type="checkbox" data-mg="restore"${m.restore ? ' checked' : ''}>Restore</label>` : ''}
+          <button class="btn btn-start" data-mg-go${m.busy ? ' disabled' : ''}>Create</button>
+        </div>
+        <div class="mg-preview" data-mg-preview></div>`;
+    }
+    const msg = m.msg ? `<div class="mg-msg ${m.msg.kind}">${esc(m.msg.text)}</div>` : '';
+    const delHint = canDel && m.del ? '<div class="mg-preview">Tap <ha-icon icon="mdi:trash-can-outline" style="--mdc-icon-size:14px"></ha-icon> on a row to delete its helpers. You\'ll be asked first.</div>' : '';
+    return `<div class="manage${m.open ? ' open' : ''}">
+        <button class="manage-head" data-mg-toggle aria-expanded="${m.open}"><ha-icon icon="mdi:wrench-outline"></ha-icon>Manage<ha-icon class="chev" icon="mdi:chevron-down"></ha-icon></button>
+        ${m.open ? `<div class="manage-body">
+          <div class="chips">${canAdd ? [
+            chip('data-mg-create', 'timer', m.create === 'timer', 'mdi:timer-plus-outline', 'Timer'),
+            chip('data-mg-create', 'switch', m.create === 'switch', 'mdi:toggle-switch-outline', 'Switch'),
+            chip('data-mg-create', 'set', m.create === 'set', 'mdi:link-variant-plus', 'Matched set'),
+          ].join('') : ''}${canDel ? chip('data-mg-del', '1', m.del, 'mdi:trash-can-outline', 'Delete', ' chip-del') : ''}</div>
+          ${form}${delHint}${msg}
+        </div>` : ''}
+      </div>`;
+  }
+
+  /** What the Create form would make right now → { plan, ids, exists, pairs } or null. */
+  _createPlan() {
+    const m = this._mg;
+    const plan = planHelperName(this._config, m.name, m.group);
+    if (!plan) return null;
+    const domains = m.create === 'timer' ? ['timer'] : m.create === 'switch' ? ['input_boolean'] : ['timer', 'input_boolean'];
+    const ids = domains.map((d) => `${d}.${plan.objectId}`);
+    const states = this._hass.states;
+    const exists = ids.filter((id) => states[id]);
+    const other = m.create === 'timer' ? `input_boolean.${plan.objectId}` : m.create === 'switch' ? `timer.${plan.objectId}` : null;
+    return { plan, ids, exists, pairs: other && states[other] ? other : null };
+  }
+
+  /** Patch the Create preview + button in place (typing must not redraw the card). */
+  _mgPreview() {
+    const box = this.shadowRoot.querySelector('[data-mg-preview]');
+    const go = this.shadowRoot.querySelector('[data-mg-go]');
+    if (!box) return;
+    const p = this._createPlan();
+    const durBad = this._mg.create !== 'switch' && !parseInput(this._mg.dur);
+    if (go) go.disabled = this._mg.busy || !p || !!p.exists.length || durBad;
+    if (!p) { box.innerHTML = 'Type a name. The card adds the prefix and group word, e.g. <code>bypass_door_patio</code>.'; return; }
+    const parts = [`Creates ${p.ids.map((id) => `<code>${esc(id)}</code>`).join(' + ')} in <b>${esc(p.plan.lands)}</b>`];
+    if (p.pairs) parts.push(`pairs with <code>${esc(p.pairs)}</code>`);
+    let html = parts.join(', ');
+    if (p.exists.length) html += `<br><span class="bad">${p.exists.map(esc).join(' and ')} already exist${p.exists.length === 1 ? 's' : ''}.</span>`;
+    if (durBad) html += '<br><span class="bad">Timer length: try 30m, 1h or 1h30m.</span>';
+    if (p.plan.warnings.length) html += `<br><span class="warn">Note: ${p.plan.warnings.map(esc).join('; ')}.</span>`;
+    box.innerHTML = html;
+  }
+
+  async _create() {
+    const p = this._createPlan();
+    const m = this._mg;
+    if (!p || p.exists.length || m.busy) return;
+    const secs = parseInput(m.dur);
+    if (m.create !== 'switch' && !secs) return;
+    m.busy = true; m.msg = null;
+    this._render();
+    const made = []; const errs = []; const notes = [];
+    for (const id of p.ids) {
+      const domain = id.split('.')[0];
+      const data = { type: `${domain}/create`, name: p.plan.name };
+      if (domain === 'timer') { data.duration = secsToHMS(secs); if (m.restore) data.restore = true; }
+      try {
+        const item = await this._hass.callWS(data);
+        const eid = `${domain}.${(item && item.id) || p.plan.objectId}`;
+        made.push(eid);
+        if (eid !== id) notes.push(`${id} was taken, so it is ${eid}`);
+        if (this._config.discovery_mode === 'label') {
+          try { await this._applyLabel(eid); } catch (e) { notes.push(`couldn't add the label to ${eid}: ${errText(e)}`); }
+        }
+      } catch (e) { errs.push(`${id}: ${errText(e)}`); }
+    }
+    m.busy = false;
+    if (made.length) m.name = '';
+    m.msg = errs.length
+      ? { kind: 'err', text: `${made.length ? `Created ${made.join(' + ')}, but ` : ''}couldn't create ${errs.join('; ')}` }
+      : { kind: notes.length ? 'err' : 'ok', text: `Created ${made.join(' + ')}${notes.length ? ` (${notes.join('; ')})` : ''}.` };
+    this._render();
+  }
+
+  /** Label discovery: give a new helper the card's label so it shows up. */
+  async _applyLabel(entityId) {
+    const slug = labelSlug(this._config.discovery_label || 'bypass');
+    const labels = (await this._hass.callWS({ type: 'config/label_registry/list' })) || [];
+    const hit = labels.find((l) => labelSlug(l.label_id) === slug) || labels.find((l) => labelSlug(l.name) === slug)
+      || labels.find((l) => labelSlug(l.label_id).startsWith(slug));
+    if (!hit) throw new Error(`there is no "${this._config.discovery_label || 'bypass'}" label`);
+    const entry = await this._hass.callWS({ type: 'config/entity_registry/get', entity_id: entityId });
+    await this._hass.callWS({ type: 'config/entity_registry/update', entity_id: entityId,
+      labels: [...new Set([...((entry && entry.labels) || []), hit.label_id])] });
+  }
+
+  /** A helper's stored id (what timer/delete and input_boolean/delete want) is its registry unique_id; fall back to the object id. */
+  async _storageId(entityId) {
+    try {
+      const e = await this._hass.callWS({ type: 'config/entity_registry/get', entity_id: entityId });
+      if (e && e.unique_id) return e.unique_id;
+    } catch (e) { /* not in the registry: try the object id */ }
+    return entityId.split('.')[1];
+  }
+
+  async _delete(row, what) {
+    const m = this._mg;
+    const targets = [];
+    if ((what === 'timer' || what === 'both') && row.timer && isEditable(this._hass, row.timer)) targets.push(['timer', row.timer]);
+    if ((what === 'switch' || what === 'both') && row.bool && isEditable(this._hass, row.bool)) targets.push(['input_boolean', row.bool]);
+    if (!targets.length || m.busy) return;
+    m.busy = true; m.confirm = null; m.msg = null;
+    this._render();
+    const done = []; const errs = [];
+    for (const [domain, id] of targets) {
+      try {
+        await this._hass.callWS({ type: `${domain}/delete`, [`${domain}_id`]: await this._storageId(id) });
+        done.push(id);
+        if (domain === 'timer') { delete this._inputSecs[id]; delete this._finishTimes[id]; delete this._pausedSecs[id]; }
+      } catch (e) { errs.push(`${id}: ${errText(e)}`); }
+    }
+    m.busy = false;
+    m.msg = errs.length
+      ? { kind: 'err', text: `${done.length ? `Deleted ${done.join(' + ')}, but ` : ''}couldn't delete ${errs.join('; ')}` }
+      : { kind: 'ok', text: `Deleted ${done.join(' + ')}.` };
+    if (!m.open) m.open = true; // the result shows in the Manage section
+    this._render();
+  }
+
+  _confirmHtml(row, secAttr, hid) {
+    const h = this._hass;
+    const t = row.timer && isEditable(h, row.timer);
+    const b = row.bool && isEditable(h, row.bool);
+    const yaml = [row.bool && !b && 'switch', row.timer && !t && 'timer'].filter(Boolean);
+    const key = esc(row.bool || row.timer);
+    const btn = (what, label) => `<button class="btn btn-del" data-del-do="${what}" data-del-row="${key}">${label}</button>`;
+    return `<div class="row-confirm${hid}"${secAttr}>Delete <b>${esc(row.label)}</b>:
+      ${t ? btn('timer', 'Timer') : ''}${b ? btn('switch', 'Switch') : ''}${t && b ? btn('both', 'Both') : ''}
+      <button class="btn btn-cancel" data-del-cancel>Cancel</button>
+      ${yaml.length ? `<span class="muted">The ${yaml.join(' and ')} ${yaml.length > 1 ? 'are' : 'is'} set up in YAML and can't be deleted here.</span>` : ''}</div>`;
+  }
+
+  _rowHtml(row, cols, hidden = false, section = '') {
     const c = this._config;
     const sl = this._c('show_button_labels');
     const t = row.timer;
+    const key = row.bool || row.timer;
+    const canDel = (row.timer && isEditable(this._hass, row.timer)) || (row.bool && isEditable(this._hass, row.bool));
+    const secAttr = section && this._collapsible() ? ` data-sec="${esc(section)}"` : '';
+    const hid = hidden ? ' sec-hidden' : '';
     const cell = {
       icon: () => `<span class="col-icon"><button class="icon-btn" data-icon-tap="${esc(row.bool || row.timer)}" title="${row.bool ? 'Turn on / off' : 'Details'}"><ha-icon icon="${esc(row.icon)}"></ha-icon></button></span>`,
       name: () => `<span class="col-name" data-more="${esc(row.bool || row.timer)}" title="${esc(row.bool || row.timer)}">${esc(row.label)}</span>`,
@@ -547,6 +869,9 @@ class BypassManagerCard extends HTMLElement {
       dur: () => `<span class="col-dur"${t ? ` data-dur="${esc(t)}" data-more="${esc(t)}" title="Timer duration"` : ''}></span>`,
       toggle: () => `<span class="col-toggle">${row.bool ? `<ha-switch data-bool="${esc(row.bool)}"></ha-switch>`
         : (this._c('show_timer_badge') ? '<span class="solo-timer-badge">timer only</span>' : '')}</span>`,
+      del: () => `<span class="col-del">${canDel
+        ? `<button class="del-btn" data-del="${esc(key)}" title="Delete…"><ha-icon icon="mdi:trash-can-outline"></ha-icon></button>`
+        : '<span class="del-na" title="Set up in YAML: can\'t be deleted here"><ha-icon icon="mdi:lock-outline"></ha-icon></span>'}</span>`,
     };
     const html = cols.map(([k], i) => {
       let h = cell[k]();
@@ -555,14 +880,43 @@ class BypassManagerCard extends HTMLElement {
       return h;
     }).join('');
     const clock = this._c('show_exact_time');
-    const lc = this._c('show_last_changed') ? `<div class="row-last-changed">${
+    const lc = this._c('show_last_changed') ? `<div class="row-last-changed${hid}"${secAttr}>${
       row.bool ? `<span>Switch: <span data-lc="${esc(row.bool)}">—</span>${clock ? ` <span class="lc-clock" data-lc-clock="${esc(row.bool)}"></span>` : ''}</span>` : ''}${
       t ? `<span>Timer: <span data-lc="${esc(t)}">—</span>${clock ? ` <span class="lc-clock" data-lc-clock="${esc(t)}"></span>` : ''}</span>` : ''}</div>` : '';
-    return `<div class="row${row.bool ? '' : ' solo-timer'}" data-row="${esc(row.bool || row.timer)}">${html}</div>${lc}`;
+    const confirm = this._delMode() && this._mg.confirm === key && canDel ? this._confirmHtml(row, secAttr, hid) : '';
+    return `<div class="row${row.bool ? '' : ' solo-timer'}${hid}" data-row="${esc(key)}"${secAttr}>${html}</div>${lc}${confirm}`;
   }
 
   _wire() {
     const root = this.shadowRoot;
+    const on = (sel, ev, fn) => root.querySelectorAll(sel).forEach((el) => el.addEventListener(ev, (e) => fn(el, e)));
+    // Collapsible groups: show / hide in place, no redraw.
+    on('[data-sec-toggle]', 'click', (el) => {
+      const g = el.dataset.secToggle;
+      const open = !this._isOpen(g);
+      this._groupOpen[g] = open;
+      el.classList.toggle('collapsed', !open);
+      el.setAttribute('aria-expanded', String(open));
+      root.querySelectorAll(`[data-sec="${cssEsc(g)}"]`).forEach((x) => x.classList.toggle('sec-hidden', !open));
+      this._patch();
+    });
+    // Manage section
+    const m = this._mg;
+    on('[data-mg-toggle]', 'click', () => { m.open = !m.open; this._render(); });
+    on('[data-mg-create]', 'click', (el) => { const v = el.dataset.mgCreate; m.create = m.create === v ? null : v; m.msg = null; this._render(); });
+    on('[data-mg-del]', 'click', () => { m.del = !m.del; m.confirm = null; m.msg = null; this._render(); });
+    on('[data-mg="name"], [data-mg="dur"]', 'input', (el) => { m[el.dataset.mg] = el.value; this._mgPreview(); });
+    on('[data-mg="name"], [data-mg="dur"]', 'keydown', (el, e) => { if (e.key === 'Enter') this._create(); });
+    on('[data-mg="group"]', 'change', (el) => { m.group = el.value; this._mgPreview(); });
+    on('[data-mg="restore"]', 'change', (el) => { m.restore = el.checked; });
+    on('[data-mg-go]', 'click', () => this._create());
+    on('[data-del]', 'click', (el) => { m.confirm = m.confirm === el.dataset.del ? null : el.dataset.del; this._render(); });
+    on('[data-del-cancel]', 'click', () => { m.confirm = null; this._render(); });
+    on('[data-del-do]', 'click', (el) => {
+      const row = this._allRows().find((r) => (r.bool || r.timer) === el.dataset.delRow);
+      if (row) this._delete(row, el.dataset.delDo);
+    });
+    this._mgPreview();
     root.querySelectorAll('ha-switch[data-bool]').forEach((sw) => sw.addEventListener('change', () => this._toggleBool(sw.dataset.bool)));
     root.querySelectorAll('[data-icon-tap]').forEach((b) => b.addEventListener('click', (e) => {
       e.stopPropagation();
@@ -591,8 +945,10 @@ class BypassManagerCard extends HTMLElement {
     const next = buildSections(this._hass, this._config);
     const sig = next.map((s) => `${s.section}:${s.rows.map((r) => `${r.bool || ''}|${r.timer || ''}`).join(',')}`).join(';');
     // A bypass appeared / disappeared, or the active-first order changed: rebuild the rows.
-    // Never while a time is being typed — the next update catches up.
-    if (sig !== this._sig && !this.shadowRoot.activeElement) { this._render(); return; }
+    // Never while a time is being typed in a row — the next update catches up. (Manage fields
+    // are fine: the redraw keeps their text and caret.)
+    const ae = this.shadowRoot.activeElement;
+    if (sig !== this._sig && !(ae && ae.dataset && ae.dataset.input)) { this._render(); return; }
     this._syncTimerTimes();
     this._patch();
   }
@@ -624,6 +980,15 @@ class BypassManagerCard extends HTMLElement {
     if (count) {
       count.textContent = on ? `${on} active` : 'All off';
       count.classList.toggle('on', on > 0);
+    }
+    // A collapsed group still says how many of its bypasses are on.
+    if (this._collapsible()) {
+      for (const s of this._sections) {
+        const el = root.querySelector(`[data-sec-on="${cssEsc(s.section)}"]`);
+        if (!el) continue;
+        const n = this._isOpen(s.section) ? 0 : s.rows.filter((r) => rowIsOn(h, r)).length;
+        el.textContent = n ? `· ${n} on` : '';
+      }
     }
     const card = root.querySelector('ha-card');
     if (card) card.classList.toggle('glow', !!(this._c('glow_when_active') && on));
@@ -918,12 +1283,22 @@ const EDITOR_CSS = `
           background: transparent; color: var(--ltek-c-accent); font-size: var(--ltek-fs-body); font-weight: var(--ltek-fw-semibold); cursor: pointer; }
         .bmce-add:hover { background: var(--ltek-c-accent-fade-soft); }
         .bmce-foot { color: var(--ltek-c-muted); font-size: var(--ltek-fs-tiny); text-align: right; }
+        .bmce-name { flex: 1 1 auto; min-width: 0; color: var(--ltek-c-text); font-size: var(--ltek-fs-label); font-weight: var(--ltek-fw-normal);
+          white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .bmce-badge { flex: none; color: var(--ltek-c-muted); font-size: var(--ltek-fs-tiny); font-variant-numeric: tabular-nums;
+          border: 1px solid var(--ltek-c-border); border-radius: var(--ltek-r-ctrl); padding: 0 var(--ltek-sp-1); }
+        .bmce-act { border: none; background: none; padding: 0; cursor: pointer; color: var(--ltek-c-icon); flex: none; line-height: 0; }
+        .bmce-act:hover { color: var(--ltek-c-icon-hover); }
+        .bmce-act.on { color: var(--ltek-c-accent); }
+        .bmce-act:disabled { opacity: .3; cursor: default; }
+        .bmce-act ha-icon { --mdc-icon-size: var(--ltek-icon-sm); }
+        .bmce-item.off .bmce-name, .bmce-item.off > ha-icon { opacity: .45; }
 `;
 
 // Settings that show or hide other settings: changing one re-renders the editor.
 const REVEAL_KEYS = new Set(['discovery_mode', 'group_rows', 'show_group_labels', 'show_dividers', 'show_icon', 'show_entity_names',
   'show_toggle', 'show_timer_input', 'show_countdown', 'show_last_changed', 'show_active_count', 'secondary_info_text',
-  ...BTN_KEYS]);
+  'collapsible_groups', 'allow_create', 'allow_delete', ...BTN_KEYS]);
 
 class BypassManagerCardEditor extends HTMLElement {
   constructor() {
@@ -1039,18 +1414,37 @@ class BypassManagerCardEditor extends HTMLElement {
     const c = this._config;
     const custom = c.custom_types || [];
     const hidden = new Set(c.hidden_types || []);
-    const groups = allGroups(custom);
+    const grouped = this._c('group_rows');
+    const collapsible = grouped && this._c('collapsible_groups');
+    const collapsed = new Set(c.collapsed_groups || []);
+    const order = orderedGroups(c);
     const rows = this._hass ? discover(this._hass, c) : [];
     const counts = {};
     rows.forEach((r) => { const g = groupFor(r.suffix, custom).label; counts[g] = (counts[g] || 0) + 1; });
+    const act = (attr, val, icon, title, { disabled = false, on = false } = {}) => `<button class="bmce-act${on ? ' on' : ''}" ${attr}="${esc(val)}" title="${esc(title)}"${
+      disabled ? ' disabled' : ''}><ha-icon icon="${icon}"></ha-icon></button>`;
+    const legend = [grouped && 'arrows set the order', 'the eye shows or hides a group', collapsible && 'the chevron sets whether it starts open (⌄) or collapsed (›)'].filter(Boolean);
     return `<p class="bmce-hint">Each bypass lands in a group by the first type word in its name (motion, door, window, light, lock, scene, alarm, weather), or in Other.</p>
-      <div class="bmce-group first">Show groups</div>
-      <div class="bmce-checks">${groups.map((g) => `<label class="bmce-check"><input type="checkbox" data-group="${esc(g)}"${hidden.has(g) ? '' : ' checked'}>${esc(g)}${
-        this._hass ? ` <span class="muted">${counts[g] || 0}</span>` : ''}</label>`).join('')}</div>
+      <div class="bmce-group first">Groups</div>
+      <p class="bmce-hint">On each row, ${legend.join(', ')}.${grouped ? '' : ' Order applies when rows are grouped.'}</p>
+      <div class="bmce-list">${order.map((g, i) => {
+        const off = hidden.has(g);
+        const startsCollapsed = collapsed.has(g);
+        return `<div class="bmce-item bmce-grp${off ? ' off' : ''}" data-grp-row="${esc(g)}">
+          <ha-icon icon="${esc(groupIcon(g, custom))}"></ha-icon>
+          <span class="bmce-name">${esc(g)}</span>${this._hass ? `<span class="bmce-badge" title="Bypasses in this group">${counts[g] || 0}</span>` : ''}
+          ${grouped ? `${act('data-grp-up', i, 'mdi:arrow-up', 'Move up', { disabled: i === 0 })}${act('data-grp-down', i, 'mdi:arrow-down', 'Move down', { disabled: i === order.length - 1 })}` : ''}
+          ${act('data-grp-vis', g, off ? 'mdi:eye-off-outline' : 'mdi:eye-outline', off ? 'Hidden: tap to show' : 'Shown: tap to hide', { on: !off })}
+          ${collapsible ? act('data-grp-start', g, startsCollapsed ? 'mdi:chevron-right' : 'mdi:chevron-down',
+    startsCollapsed ? 'Starts collapsed: tap to start open' : 'Starts open: tap to start collapsed', { disabled: off }) : ''}
+        </div>`;
+      }).join('')}</div>
+      ${c.group_order ? '<button class="bmce-add" data-grp-reset>↺ Default order</button>' : ''}
       <div class="bmce-group">Layout</div>
       ${this._check('group_rows', 'Group rows by type', '(off: one list)')}
-      ${this._c('group_rows') ? `${this._check('show_group_labels', 'Show group titles')}${this._check('show_dividers', 'Show a line between groups')}` : ''}
-      ${this._select('sort', 'Order', [['name', 'By name'], ['active', 'Active first, newest change first']])}
+      ${grouped ? `${this._check('collapsible_groups', 'Groups can be collapsed', '(tap a group title)')}${
+    collapsible ? '' : this._check('show_group_labels', 'Show group titles')}${this._check('show_dividers', 'Show a line between groups')}` : ''}
+      ${this._select('sort', 'Row order', [['name', 'By name'], ['active', 'Active first, newest change first']])}
       <div class="bmce-group">Custom groups</div>
       <p class="bmce-hint">A keyword found anywhere in a name puts it in your group. Custom groups are checked before the built-in ones.</p>
       <div class="bmce-list">
@@ -1108,6 +1502,19 @@ class BypassManagerCardEditor extends HTMLElement {
       </div>`;
   }
 
+  _manageBody() {
+    const label = this._c('discovery_mode') === 'label';
+    const prefix = this._config.entity_prefix || 'bypass_';
+    return `<p class="bmce-hint">Create and delete bypass helpers right on the card. A <b>Manage</b> section appears under the title, collapsed,
+        with a chip for each. Only admin users see it.</p>
+      ${this._check('allow_create', 'Create', '(Timer, Switch, or a Matched set of both)')}
+      ${this._check('allow_delete', 'Delete', '(a trash button on each row; asks first)')}
+      ${this._c('allow_create') ? `<p class="bmce-hint">New helpers follow the card's naming: prefix + group word + name, so group <b>Door</b> + "Patio" is
+        <code>${esc(slugify(`${prefix}door_patio`))}</code>. A name that already has a group word keeps it ("Office light" → <code>${esc(slugify(`${prefix}office_light`))}</code>).${
+  label ? ` New helpers also get the "${esc(this._config.discovery_label || 'bypass')}" label so the card finds them.` : ''}</p>` : ''}
+      ${this._c('allow_delete') ? '<p class="bmce-hint">Deleting is permanent. Helpers set up in YAML show a lock and can\'t be deleted here.</p>' : ''}`;
+  }
+
   _lookBody() {
     const c = (k) => this._colorControl(k);
     const s = (k) => { const d = SIZE_DEFS.find((x) => x[0] === k); return this._slider(k, d[1], d[2], d[3]); };
@@ -1116,8 +1523,8 @@ class BypassManagerCardEditor extends HTMLElement {
         ...(this._c('secondary_info_text') ? [s('secondary_info_size'), c('secondary_info_color')] : [])]],
       ['look-names', 'Names & switch', [s('font_size_name'), c('active_color'), c('color_entity_off')]],
       ...(this._c('show_icon') ? [['look-icons', 'Icons', [s('icon_size'), c('icon_color_on'), c('icon_color_off')]]] : []),
-      ...(this._c('group_rows') && (this._c('show_group_labels') || this._c('show_dividers')) ? [['look-groups', 'Groups', [
-        ...(this._c('show_group_labels') ? [s('font_size_group'), c('color_group_label')] : []),
+      ...(this._c('group_rows') && (this._c('show_group_labels') || this._c('collapsible_groups') || this._c('show_dividers')) ? [['look-groups', 'Groups', [
+        ...(this._c('show_group_labels') || this._c('collapsible_groups') ? [s('font_size_group'), c('color_group_label')] : []),
         ...(this._c('show_dividers') ? [c('color_divider')] : [])]]] : []),
       ...(this._c('show_timer_input') || this._c('show_countdown') ? [['look-timer', 'Timer', [s('font_size_timer')]]] : []),
       ...(this._c('show_last_changed') ? [['look-lc', 'Last changed', [s('font_size_last_changed'), c('color_last_changed')]]] : []),
@@ -1132,6 +1539,7 @@ class BypassManagerCardEditor extends HTMLElement {
         ${this._panel('discovery', 'mdi:magnify', 'Discovery', this._discoveryBody())}
         ${this._panel('groups', 'mdi:shape-outline', 'Groups & order', this._groupsBody())}
         ${this._panel('rows', 'mdi:view-list-outline', 'Rows & timer controls', this._rowsBody())}
+        ${this._panel('manage', 'mdi:wrench-outline', 'Create & delete', this._manageBody())}
         ${this._panel('header', 'mdi:format-title', 'Title', this._headerBody())}
         ${this._panel('names', 'mdi:format-letter-case', 'Names', this._namesBody())}
         ${this._panel('look', 'mdi:palette', 'Appearance', this._lookBody())}
@@ -1158,29 +1566,55 @@ class BypassManagerCardEditor extends HTMLElement {
       el.addEventListener('change', () => { this._set(key, Number(el.value)); this._render(); });
     });
     all('[data-reset]', (b) => b.addEventListener('click', () => { this._set(b.dataset.reset, ''); this._render(); }));
-    all('[data-group]', (el) => el.addEventListener('change', () => {
-      const g = el.dataset.group;
-      const list = (this._config.hidden_types || []).filter((x) => x !== g);
-      if (!el.checked) list.push(g);
-      this._config.hidden_types = list;
-      this._emit();
-    }));
+    // Group rows: order, show / hide, start open / collapsed
+    const move = (i, d) => {
+      const o = orderedGroups(this._config);
+      const j = i + d;
+      if (j < 0 || j >= o.length) return;
+      [o[i], o[j]] = [o[j], o[i]];
+      this._config.group_order = o;
+      this._emit(); this._render();
+    };
+    all('[data-grp-up]', (b) => b.addEventListener('click', () => move(Number(b.dataset.grpUp), -1)));
+    all('[data-grp-down]', (b) => b.addEventListener('click', () => move(Number(b.dataset.grpDown), 1)));
+    all('[data-grp-reset]', (b) => b.addEventListener('click', () => { delete this._config.group_order; this._emit(); this._render(); }));
+    const flip = (key, g) => {
+      const list = this._config[key] || [];
+      this._config[key] = list.includes(g) ? list.filter((x) => x !== g) : [...list, g];
+      this._emit(); this._render();
+    };
+    all('[data-grp-vis]', (b) => b.addEventListener('click', () => flip('hidden_types', b.dataset.grpVis)));
+    all('[data-grp-start]', (b) => b.addEventListener('click', () => flip('collapsed_groups', b.dataset.grpStart)));
     // Custom groups
     const saveCt = (list) => { this._config.custom_types = list; this._emit(); this._render(); };
+    // A renamed group keeps its place, visibility and start state.
+    const renameGroup = (from, to) => {
+      if (!from || from === to) return;
+      for (const k of ['hidden_types', 'collapsed_groups', 'group_order']) {
+        if (Array.isArray(this._config[k])) this._config[k] = this._config[k].map((g) => (g === from ? to : g)).filter(Boolean);
+      }
+    };
     all('[data-ct]', (el) => el.addEventListener('change', () => {
       const list = (this._config.custom_types || []).map((x) => ({ ...x }));
       const item = list[Number(el.dataset.ct)];
       if (!item) return;
       const v = el.value.trim();
       if (el.dataset.field === 'icon') { if (v) item.icon = v.includes(':') ? v : `mdi:${v}`; else delete item.icon; }
-      else item[el.dataset.field] = v;
+      else {
+        if (el.dataset.field === 'label') renameGroup(item.label, v);
+        item[el.dataset.field] = v;
+      }
       saveCt(list);
     }));
     all('[data-ct-del]', (b) => b.addEventListener('click', () => {
       const i = Number(b.dataset.ctDel);
       const removed = (this._config.custom_types || [])[i];
       const list = (this._config.custom_types || []).filter((_, j) => j !== i);
-      if (removed && removed.label && this._config.hidden_types) this._config.hidden_types = this._config.hidden_types.filter((g) => g !== removed.label);
+      if (removed && removed.label) {
+        for (const k of ['hidden_types', 'collapsed_groups']) {
+          if (this._config[k]) this._config[k] = this._config[k].filter((g) => g !== removed.label);
+        }
+      }
       saveCt(list);
     }));
     all('[data-ct-add]', (b) => b.addEventListener('click', () => {
@@ -1229,6 +1663,7 @@ class BypassManagerCardEditor extends HTMLElement {
 BypassManagerCard._test = {
   BUILD_NUMBER, VERSION, CARD_CSS, EDITOR_CSS, DEFAULTS, COLOR_DEFS, GROUP_ORDER, LEGACY_GROUPS,
   normalizeConfig, groupFor, cleanDisplayName, discover, buildSections, columns, rootStyleVars, colorMode,
+  orderedGroups, planHelperName, slugify,
   fmtSecs, fmtDuration, fmtRelTime, fmtClock, parseInput, durationToSecs, secsToHMS,
 };
 

@@ -2,7 +2,7 @@
 
 [![Add to HACS](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=Ltek&repository=bypass-manager-card&category=plugin)
 
-Current build: **v2026.10.14.32** · full history in [CHANGELOG.md](CHANGELOG.md)
+Current build: **v2026.10.15.33** · full history in [CHANGELOG.md](CHANGELOG.md)
 
 A Home Assistant Dashboard card for **all** your bypass helpers: security zones, doors, windows,
 motion, lights, scenes, locks, weather and anything else. It finds every bypass `input_boolean`
@@ -23,6 +23,9 @@ timer control. There's a visual editor for every setting.
   Stop / Finish (each separately), set time with − / + steps, live countdown, timer duration, on/off switch.
 - **Last changed** line per row, with the clock time if you want it.
 - **Title line** with an active count ("3 active" / "All off") and an optional glow while anything is on.
+- **Create and delete helpers** from the card (admins only): a Timer, a Switch, or a matched set of both,
+  named the card's way (`bypass_door_patio`). YAML helpers are locked.
+- **Groups** in your own order, each one shown or hidden, and optionally collapsible (starting open or collapsed).
 - Every color follows your theme or can be custom; every size is a slider.
 
 ## Installation
@@ -77,6 +80,18 @@ hidden_types: [Other] # groups to leave off the card
 Names drop the word `bypass` and the group word: `bypass_door_front` shows as **Front**,
 `bypass_lock_front_door` as **Front Door**.
 
+## Create & delete
+
+Turn on `allow_create` and / or `allow_delete`. A **Manage** section appears under the title, collapsed.
+Only admin users see it, because Home Assistant only lets admins create or delete helpers.
+
+- **Timer / Switch / Matched set**: choose a group, type a name (and a timer length). The card builds the
+  name the way it reads names: prefix + group word + name, so **Door** + "Patio" is `bypass_door_patio`.
+  A name that already has a group word keeps it ("Office light" → `bypass_office_light`). The preview shows
+  the entity IDs and the group before you create. In label mode the new helper also gets the label.
+- **Delete**: puts a trash button on every row. Tap it, then choose Timer, Switch or Both. Deleting is
+  permanent. Helpers set up in YAML show a lock instead.
+
 ## Set time
 
 The time field takes `30` (minutes), `30m`, `90s`, `1h`, `1h30m` or `2m30s`. − / + change it by the
@@ -93,7 +108,12 @@ Every option is in the visual editor. Leave an option out to get its default.
 | `discovery_label` | `bypass` | Label mode: HA label (also matches labels that start with it) |
 | `hidden_types` | none | Groups to hide |
 | `custom_types` | none | `[{ keyword, label, icon }]` |
+| `group_order` | default order | Groups in your order (set with the ↑ / ↓ arrows) |
 | `group_rows` | `true` | `false` = one flat list |
+| `collapsible_groups` | `false` | Tap a group title to fold it |
+| `collapsed_groups` | none | Groups that start collapsed |
+| `allow_create` | `false` | Manage section: create a Timer, Switch or Matched set (admins only) |
+| `allow_delete` | `false` | Manage section: delete helpers from their row (admins only) |
 | `sort` | `name` | `name`, or `active` (active first, newest change first) |
 | `show_group_labels` | `true` | Group titles |
 | `show_dividers` | `true` | Line between groups |
